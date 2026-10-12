@@ -28,6 +28,80 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
+// Coarse loop node. kind -2 is a whole wire, kind -1 is a cell whose
+// bit-level edges were too wide to store directly.
+using WireNode = std::pair<RTLIL::IdString, int>;
+
+static void wire_finish_order(const dict<WireNode, pool<WireNode>> &fwd, std::vector<WireNode> &order)
+{
+	pool<WireNode> entered, finished;
+	std::vector<WireNode> stack;
+	for (auto &it : fwd) {
+		if (entered.count(it.first))
+			continue;
+		stack.push_back(it.first);
+		while (!stack.empty()) {
+			WireNode node = stack.back();
+			if (!entered.count(node)) {
+				entered.insert(node);
+				auto fit = fwd.find(node);
+				if (fit != fwd.end()) {
+					for (const WireNode &next : fit->second)
+						if (!entered.count(next))
+							stack.push_back(next);
+				}
+			} else {
+				stack.pop_back();
+				if (finished.insert(node).second)
+					order.push_back(node);
+			}
+		}
+	}
+}
+
+// Wires that sit in a coarse cycle. A bit-level loop is always inside one of
+// these, so the per-bit graph is built only for them.
+static pool<RTLIL::IdString> live_loop_wires(const dict<WireNode, pool<WireNode>> &fwd, const dict<WireNode, pool<WireNode>> &rev)
+{
+	std::vector<WireNode> order;
+	wire_finish_order(fwd, order);
+
+	pool<WireNode> seen;
+	pool<RTLIL::IdString> live;
+	for (auto it = order.rbegin(); it != order.rend(); ++it) {
+		if (!seen.insert(*it).second)
+			continue;
+		pool<WireNode> comp;
+		std::vector<WireNode> stack = {*it};
+		comp.insert(*it);
+		while (!stack.empty()) {
+			WireNode node = stack.back();
+			stack.pop_back();
+			auto rit = rev.find(node);
+			if (rit == rev.end())
+				continue;
+			for (const WireNode &next : rit->second) {
+				if (!seen.insert(next).second)
+					continue;
+				comp.insert(next);
+				stack.push_back(next);
+			}
+		}
+		bool self = false;
+		if (comp.size() == 1) {
+			const WireNode &only = *comp.begin();
+			auto fit = fwd.find(only);
+			self = fit != fwd.end() && fit->second.count(only);
+		}
+		if (comp.size() < 2 && !self)
+			continue;
+		for (const WireNode &node : comp)
+			if (node.second == -2)
+				live.insert(node.first);
+	}
+	return live;
+}
+
 struct CheckPass : public Pass {
 	CheckPass() : Pass("check", "check for obvious problems in the design") { }
 	bool formatted_help() override {
@@ -160,6 +234,7 @@ struct CheckPass : public Pass {
 			dict<SigBit, int> wire_drivers_count;
 			pool<SigBit> used_wires;
 			TopoSort<std::pair<RTLIL::IdString, int>> topo;
+			dict<WireNode, pool<WireNode>> coarse_fwd, coarse_rev;
 			for (auto &proc_it : module->processes)
 			{
 				pool<SigBit> proc_driven_bits;
@@ -214,12 +289,35 @@ struct CheckPass : public Pass {
 			}
 
 			struct CircuitEdgesDatabase : AbstractCellEdgesDatabase {
-				TopoSort<std::pair<RTLIL::IdString, int>> &topo;
+				TopoSort<std::pair<RTLIL::IdString, int>> *bit_topo;
+				dict<WireNode, pool<WireNode>> *coarse_fwd;
+				dict<WireNode, pool<WireNode>> *coarse_rev;
+				const pool<RTLIL::IdString> *live_wires;
 				SigMap sigmap;
 				bool force_detail;
 
-				CircuitEdgesDatabase(TopoSort<std::pair<RTLIL::IdString, int>> &topo, SigMap &sigmap, bool force_detail)
-					: topo(topo), sigmap(sigmap), force_detail(force_detail) {}
+				CircuitEdgesDatabase(TopoSort<std::pair<RTLIL::IdString, int>> *bit_topo,
+						     dict<WireNode, pool<WireNode>> *coarse_fwd,
+						     dict<WireNode, pool<WireNode>> *coarse_rev,
+						     const pool<RTLIL::IdString> *live_wires, SigMap &sigmap, bool force_detail)
+					: bit_topo(bit_topo), coarse_fwd(coarse_fwd), coarse_rev(coarse_rev), live_wires(live_wires),
+					  sigmap(sigmap), force_detail(force_detail) {}
+
+				void link_wire(WireNode from, WireNode to)
+				{
+					(*coarse_fwd)[from].insert(to);
+					(*coarse_fwd)[to];
+					(*coarse_rev)[to].insert(from);
+				}
+
+				bool wire_kept(const RTLIL::SigBit &bit) const
+				{
+					if (!bit.wire)
+						return false;
+					if (live_wires && !live_wires->count(bit.wire->name))
+						return false;
+					return true;
+				}
 
 				void add_edge(RTLIL::Cell *cell, RTLIL::IdString from_port, int from_bit,
 							  RTLIL::IdString to_port, int to_bit, int) override {
@@ -230,8 +328,14 @@ struct CheckPass : public Pass {
 					SigBit from = sigmap(from_portsig[from_bit]);
 					SigBit to = sigmap(to_portsig[to_bit]);
 
-					if (from.wire && to.wire)
-						topo.edge(std::make_pair(from.wire->name, from.offset), std::make_pair(to.wire->name, to.offset));
+					if (!from.wire || !to.wire)
+						return;
+					if (live_wires && (!live_wires->count(from.wire->name) || !live_wires->count(to.wire->name)))
+						return;
+					if (bit_topo)
+						bit_topo->edge(std::make_pair(from.wire->name, from.offset), std::make_pair(to.wire->name, to.offset));
+					else
+						link_wire(WireNode(from.wire->name, -2), WireNode(to.wire->name, -2));
 				}
 
 				bool detail_costly(Cell *cell) {
@@ -271,24 +375,48 @@ struct CheckPass : public Pass {
 				}
 
 				bool add_edges_from_cell(Cell *cell) {
+					// The wire filter never needs a per-bit edge list. One edge per
+					// connected wire is enough to decide which wires can be in a loop.
+					if (!bit_topo) {
+						pool<RTLIL::IdString> in_wires, out_wires;
+						for (auto &conn : cell->connections()) {
+							SigSpec sig = sigmap(conn.second);
+							for (auto const &chunk : sig.chunks()) {
+								if (!chunk.wire)
+									continue;
+								if (cell->input(conn.first))
+									in_wires.insert(chunk.wire->name);
+								if (cell->output(conn.first))
+									out_wires.insert(chunk.wire->name);
+							}
+						}
+						for (auto &name : in_wires)
+							link_wire(WireNode(name, -2), WireNode(cell->name, -1));
+						for (auto &name : out_wires)
+							link_wire(WireNode(cell->name, -1), WireNode(name, -2));
+						return true;
+					}
+
 					if (force_detail || !detail_costly(cell)) {
 						if (AbstractCellEdgesDatabase::add_edges_from_cell(cell))
 							return true;
 					}
 
-					// We don't have accurate cell edges, do the fallback of all input-output pairs
-					for (auto &conn : cell->connections()) {
-						if (cell->input(conn.first))
-						for (auto bit : sigmap(conn.second))
-						if (bit.wire)
-							topo.edge(std::make_pair(bit.wire->name, bit.offset),
-									  std::make_pair(cell->name, -1));
+					// Bit fallback for cells whose detailed edges would be quadratic.
+					{
+						for (auto &conn : cell->connections()) {
+							if (cell->input(conn.first))
+							for (auto bit : sigmap(conn.second))
+							if (wire_kept(bit))
+								bit_topo->edge(std::make_pair(bit.wire->name, bit.offset),
+										std::make_pair(cell->name, -1));
 
-						if (cell->output(conn.first))
-						for (auto bit : sigmap(conn.second))
-						if (bit.wire)
-							topo.edge(std::make_pair(cell->name, -1),
-									  std::make_pair(bit.wire->name, bit.offset));
+							if (cell->output(conn.first))
+							for (auto bit : sigmap(conn.second))
+							if (wire_kept(bit))
+								bit_topo->edge(std::make_pair(cell->name, -1),
+										std::make_pair(bit.wire->name, bit.offset));
+						}
 					}
 
 					// Return false to signify the fallback
@@ -296,7 +424,7 @@ struct CheckPass : public Pass {
 				}
 			};
 
-			CircuitEdgesDatabase edges_db(topo, sigmap, force_detailed_loop_check);
+			CircuitEdgesDatabase edges_db(nullptr, &coarse_fwd, &coarse_rev, nullptr, sigmap, force_detailed_loop_check);
 
 			pool<Cell *> coarsened_cells;
 			for (auto cell : module->cells())
@@ -399,6 +527,17 @@ struct CheckPass : public Pass {
 					log_warning("Wire %s.%s is used but has no driver.\n", module, log_signal(bit));
 					counter++;
 				}
+
+			pool<RTLIL::IdString> live_wires = live_loop_wires(coarse_fwd, coarse_rev);
+			if (!live_wires.empty()) {
+				CircuitEdgesDatabase bit_db(&topo, nullptr, nullptr, &live_wires, sigmap, force_detailed_loop_check);
+				for (auto cell : module->cells()) {
+					if (yosys_celltypes.cell_evaluable(cell->type) || cell->type.in(ID($mem_v2), ID($memrd), ID($memrd_v2), ID($barrier)) \
+							|| cell->is_builtin_ff())
+						if (!bit_db.add_edges_from_cell(cell))
+							coarsened_cells.insert(cell);
+				}
+			}
 
 			topo.sort();
 			for (auto &loop : topo.loops) {

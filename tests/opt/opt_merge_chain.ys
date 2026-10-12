@@ -1,0 +1,16 @@
+# The second pair of adds matches only after the first pair is tied together.
+read_verilog <<EOT
+module top(input [7:0] a, b, output [7:0] y, z);
+  wire [7:0] y1, y2;
+  assign y1 = a + b;
+  assign y2 = a + b;
+  assign y = y1 + a;
+  assign z = y2 + a;
+endmodule
+EOT
+hierarchy -top top
+proc
+select -assert-count 4 t:$add
+equiv_opt -assert opt_merge
+design -load postopt
+select -assert-count 2 t:$add

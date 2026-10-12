@@ -8,6 +8,7 @@ yosys_gtest(kernel
 	rtlilHelpers.h
 	rtlilStringTest.cc
 	rtlilTest.cc
+	sigmapTest.cc
 	sigspecExtractTest.cc
 	sigspecRemove2Test.cc
 	threadingTest.cc

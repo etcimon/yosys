@@ -72,6 +72,8 @@ struct CellHashes
 {
 	// Entry i contains the hashes where hash_value % bucketed_cell_hashes.size() == i
 	std::vector<std::vector<CellHash>> bucketed_cell_hashes;
+	// Mapped input wires of each hashed cell, paired with that cell's index.
+	std::vector<std::pair<int, RTLIL::Wire *>> wire_uses;
 };
 
 // A duplicate cell that has been found.
@@ -178,6 +180,18 @@ struct OptMergeThreadWorker
 		return h;
 	}
 
+	void collect_input_wires(const RTLIL::Cell *cell, pool<RTLIL::Wire *> &wires) const
+	{
+		for (auto &conn : cell->connections()) {
+			if (cell->output(conn.first))
+				continue;
+			SigSpec sig = assign_map(conn.second);
+			for (auto const &chunk : sig.chunks())
+				if (chunk.wire != nullptr)
+					wires.insert(chunk.wire);
+		}
+	}
+
 	static Hasher hash_cell_parameters(const RTLIL::Cell *cell, Hasher h)
 	{
 		hashlib::commutative_hash comm;
@@ -275,6 +289,7 @@ struct OptMergeThreadWorker
 	CellHashes compute_cell_hashes(const CellRange &cell_range) const
 	{
 		std::vector<std::vector<CellHash>> bucketed_cell_hashes(workers);
+		std::vector<std::pair<int, RTLIL::Wire *>> wire_uses;
 		for (int cell_index = cell_range.begin; cell_index < cell_range.end; ++cell_index) {
 			const RTLIL::Cell *cell = module->cell_at(cell_index);
 			if (!module->selected(cell))
@@ -296,8 +311,12 @@ struct OptMergeThreadWorker
 			Hasher::hash_t h = hash_cell_function(cell, Hasher()).yield();
 			int bucket_index = h % workers;
 			bucketed_cell_hashes[bucket_index].push_back({cell_index, h});
+			pool<RTLIL::Wire *> wires;
+			collect_input_wires(cell, wires);
+			for (auto wire : wires)
+				wire_uses.push_back({cell_index, wire});
 		}
-		return {std::move(bucketed_cell_hashes)};
+		return {std::move(bucketed_cell_hashes), std::move(wire_uses)};
 	}
 
 	FoundDuplicates find_duplicate_cells(int index, const Shards &in) const
@@ -393,33 +412,113 @@ struct OptMergeWorker
 			}
 		});
 
+		// Hash of every cell the pass is willing to merge, and the wires those
+		// hashes were computed from. A merge only changes cells that read one
+		// of the redirected wires, so later rounds rehash that set.
+		dict<RTLIL::Cell *, Hasher::hash_t> cell_hash;
+		dict<RTLIL::Wire *, std::vector<RTLIL::Cell *>> wire_cells;
+		dict<RTLIL::Cell *, pool<RTLIL::Wire *>> cell_wires;
+		pool<RTLIL::Cell *> dirty_cells;
+
+		auto watch = [&](RTLIL::Cell *cell, RTLIL::Wire *wire) {
+			if (cell_wires[cell].insert(wire).second)
+				wire_cells[wire].push_back(cell);
+		};
+		auto unwatch = [&](RTLIL::Cell *cell) {
+			auto found = cell_wires.find(cell);
+			if (found == cell_wires.end())
+				return;
+			for (auto wire : found->second) {
+				auto &users = wire_cells[wire];
+				users.erase(std::remove(users.begin(), users.end(), cell), users.end());
+			}
+			cell_wires.erase(found);
+		};
+		auto absorb_hashes = [&](const std::vector<std::vector<std::vector<CellHash>>> &shards) {
+			for (auto &shard : shards)
+				for (auto &bucket : shard)
+					for (auto const &ch : bucket)
+						cell_hash[module->cell_at(ch.cell_index)] = ch.hash_value;
+		};
+		auto absorb_wires = [&](const std::vector<std::pair<int, RTLIL::Wire *>> &uses) {
+			for (auto const &use : uses)
+				watch(module->cell_at(use.first), use.second);
+		};
+		auto fill_shards = [&](std::vector<std::vector<std::vector<CellHash>>> &shards) {
+			int cells_size = module->cells_size();
+			shards.assign(workers, {});
+			for (auto &shard : shards)
+				shard.assign(workers, {});
+			int cells_size_mod_workers = cells_size % workers;
+			int cell_index = 0;
+			for (int i = 0; i < workers; i++) {
+				int num_cells = cells_size / workers + ((i < cells_size_mod_workers) ? 1 : 0);
+				for (int n = 0; n < num_cells; n++, cell_index++) {
+					RTLIL::Cell *cell = module->cell_at(cell_index);
+					auto it = cell_hash.find(cell);
+					if (it == cell_hash.end())
+						continue;
+					int bucket = it->second % workers;
+					shards[i][bucket].push_back({cell_index, it->second});
+				}
+			}
+		};
+
 		bool did_something = true;
 		// A cell may have to go through a lot of collisions if the hash
 		// function is performing poorly, but it's a symptom of something bad
 		// beyond the user's control.
 		while (did_something)
 		{
-			int cells_size = module->cells_size();
-			log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
-			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
+			// Merges below add connections and drop the chunk cache. Rebuild
+			// it on this thread before the parallel hash reads the map.
+			assign_map.rebuild_canon();
+			// The previous round merged cells and nothing reads the tied wires.
+			if (!cell_hash.empty() && dirty_cells.empty())
+				break;
 
-			int cell_index = 0;
-			int cells_size_mod_workers = cells_size % workers;
-			{
-				Multithreading multithreading;
-				for (int i = 0; i < workers; ++i) {
-					int num_cells = cells_size/workers + ((i < cells_size_mod_workers) ? 1 : 0);
-					CellRange c = { cell_index, cell_index + num_cells };
-					cell_index += num_cells;
+			int cells_size = module->cells_size();
+			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
+			if (cell_hash.empty()) {
+				log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
+				int cell_index = 0;
+				int cells_size_mod_workers = cells_size % workers;
+				{
+					Multithreading multithreading;
+					for (int i = 0; i < workers; ++i) {
+						int num_cells = cells_size/workers + ((i < cells_size_mod_workers) ? 1 : 0);
+						CellRange c = { cell_index, cell_index + num_cells };
+						cell_index += num_cells;
+						if (num_worker_threads > 0)
+							cell_ranges_queues[i].push_back(c);
+						else {
+							CellHashes got = thread_worker.compute_cell_hashes(c);
+							absorb_wires(got.wire_uses);
+							sharded_bucketed_cell_hashes[i] = std::move(got.bucketed_cell_hashes);
+						}
+					}
+					log_assert(cell_index == cells_size);
 					if (num_worker_threads > 0)
-						cell_ranges_queues[i].push_back(c);
-					else
-						sharded_bucketed_cell_hashes[i] = std::move(thread_worker.compute_cell_hashes(c).bucketed_cell_hashes);
+						for (int i = 0; i < workers; ++i) {
+							CellHashes got = std::move(*cell_hashes_queues[i].pop_front());
+							absorb_wires(got.wire_uses);
+							sharded_bucketed_cell_hashes[i] = std::move(got.bucketed_cell_hashes);
+						}
 				}
-				log_assert(cell_index == cells_size);
-				if (num_worker_threads > 0)
-					for (int i = 0; i < workers; ++i)
-						sharded_bucketed_cell_hashes[i] = std::move(cell_hashes_queues[i].pop_front()->bucketed_cell_hashes);
+				absorb_hashes(sharded_bucketed_cell_hashes);
+			} else {
+				log("Rehashing %d cells of `%s'.\n", GetSize(dirty_cells), module->name);
+				for (auto cell : dirty_cells) {
+					if (!cell_hash.count(cell))
+						continue;
+					cell_hash[cell] = thread_worker.hash_cell_function(cell, Hasher()).yield();
+					pool<RTLIL::Wire *> wires;
+					thread_worker.collect_input_wires(cell, wires);
+					for (auto wire : wires)
+						watch(cell, wire);
+				}
+				dirty_cells.clear();
+				fill_shards(sharded_bucketed_cell_hashes);
 			}
 
 			log("Finding duplicate cells in `%s'.\n", module->name);
@@ -464,16 +563,23 @@ struct OptMergeWorker
 						Const init = initvals(keep_sig);
 						initvals.remove_init(it.second);
 						initvals.remove_init(keep_sig);
-						module->connect(RTLIL::SigSig(it.second, keep_sig));
-						auto keep_sig_it = keep_sig.begin();
-						for (SigBit remove_sig_bit : it.second) {
-							assign_map.add(remove_sig_bit, *keep_sig_it);
-							++keep_sig_it;
+						SigSpec mapped = assign_map(it.second);
+						for (auto const &chunk : mapped.chunks()) {
+							if (chunk.wire == nullptr)
+								continue;
+							for (auto cell : wire_cells[chunk.wire])
+								if (cell != remove_cell && cell_hash.count(cell))
+									dirty_cells.insert(cell);
 						}
+						module->connect(RTLIL::SigSig(it.second, keep_sig));
+						assign_map.add(it.second, keep_sig);
 						initvals.set_init(keep_sig, init);
 					}
 				}
 				log_debug("    Removing %s cell `%s' from module `%s'.\n", remove_cell->type, remove_cell->name, module->name);
+				dirty_cells.erase(remove_cell);
+				unwatch(remove_cell);
+				cell_hash.erase(remove_cell);
 				module->remove(remove_cell);
 				total_count++;
 			}

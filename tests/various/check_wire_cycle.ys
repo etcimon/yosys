@@ -1,0 +1,73 @@
+# Wire-level cycle with no bit cycle: q[0] -> p[0], p[1] -> q[1].
+design -reset
+read_rtlil <<EOF
+module \shift
+  wire width 2 input 2 \s
+  wire width 2 output 2 \p
+  wire width 2 output 2 \q
+  cell $buf $bq
+    parameter \WIDTH 1
+    connect \A \s [0]
+    connect \Y \q [0]
+  end
+  cell $buf $bp
+    parameter \WIDTH 1
+    connect \A \s [1]
+    connect \Y \p [1]
+  end
+  cell $not $nq
+    parameter \A_SIGNED 0
+    parameter \A_WIDTH 1
+    parameter \Y_WIDTH 1
+    connect \A \q [0]
+    connect \Y \p [0]
+  end
+  cell $not $np
+    parameter \A_SIGNED 0
+    parameter \A_WIDTH 1
+    parameter \Y_WIDTH 1
+    connect \A \p [1]
+    connect \Y \q [1]
+  end
+end
+module \fwd
+  wire width 32 input 32 \x
+  wire width 32 output 32 \y
+  cell $buf $b
+    parameter \WIDTH 32
+    connect \A \x
+    connect \Y \y
+  end
+end
+EOF
+logger -expect-no-warnings
+check
+logger -check-expected
+
+# Bit cycle through $xor: A and Y are the same wire.
+design -reset
+read_rtlil <<EOF
+module \loop
+  wire input 1 \b
+  wire output 1 \y
+  wire \a
+  cell $xor $x
+    parameter \A_SIGNED 0
+    parameter \B_SIGNED 0
+    parameter \A_WIDTH 1
+    parameter \B_WIDTH 1
+    parameter \Y_WIDTH 1
+    connect \A \a
+    connect \B \b
+    connect \Y \a
+  end
+  cell $buf $by
+    parameter \WIDTH 1
+    connect \A \a
+    connect \Y \y
+  end
+end
+EOF
+logger -expect warning "found logic loop in module loop:" 1
+check
+logger -check-expected

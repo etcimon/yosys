@@ -239,18 +239,217 @@ class SigSet<T, sort_by_name_id_guard<T>> : public SigSet<T, RTLIL::sort_by_name
 
 struct SigMapView
 {
+	// One contiguous alias. Bit (offset + i) maps to image bit i.
+	struct AliasRange {
+		int offset;
+		int width;
+		RTLIL::SigChunk image;
+	};
+
 	mfp<SigBit> database;
+	// Wires with at least one bit stored in the union-find. An unaliased
+	// chunk is already canonical, so apply() must not unpack it.
+	pool<RTLIL::Wire *> touched_wires;
+	// Wires that have individual bits in the union-find. A wire that only
+	// has AliasRange entries is not in this set.
+	pool<RTLIL::Wire *> bit_wires;
+	// Source wire -> non-overlapping aliases, ordered by offset.
+	dict<RTLIL::Wire *, std::vector<AliasRange>> alias_ranges;
+	// Image wire -> (source wire, source offset) of ranges that point at it.
+	dict<RTLIL::Wire *, std::vector<std::pair<RTLIL::Wire *, int>>> image_users;
+	// Image of a touched wire whose bits map onto one chunk. Rebuilt on the
+	// writing thread before any parallel reader of this map.
+	dict<RTLIL::Wire *, RTLIL::SigChunk> canon_chunk;
+	bool canon_valid = false;
+
+	void touch_bit(const RTLIL::SigBit &bit)
+	{
+		if (bit.wire != nullptr)
+			touched_wires.insert(bit.wire);
+	}
+
+	void invalidate_canon()
+	{
+		canon_chunk.clear();
+		canon_valid = false;
+	}
+
+	void clear_aliases()
+	{
+		alias_ranges.clear();
+		image_users.clear();
+		bit_wires.clear();
+	}
+
+	const AliasRange *find_alias(RTLIL::Wire *wire, int offset) const
+	{
+		auto found = alias_ranges.find(wire);
+		if (found == alias_ranges.end())
+			return nullptr;
+		for (const AliasRange &range : found->second)
+			if (offset >= range.offset && offset < range.offset + range.width)
+				return &range;
+		return nullptr;
+	}
+
+	bool alias_overlaps(RTLIL::Wire *wire, int offset, int width) const
+	{
+		auto found = alias_ranges.find(wire);
+		if (found == alias_ranges.end())
+			return false;
+		for (const AliasRange &range : found->second)
+			if (offset < range.offset + range.width && range.offset < offset + width)
+				return true;
+		return false;
+	}
+
+	static RTLIL::SigBit alias_bit(const AliasRange &range, int offset)
+	{
+		const int delta = offset - range.offset;
+		if (range.image.wire == nullptr)
+			return RTLIL::SigBit(range.image.data[delta]);
+		return RTLIL::SigBit(range.image.wire, range.image.offset + delta);
+	}
+
+	RTLIL::SigChunk compose_image(RTLIL::SigChunk image) const
+	{
+		for (int hop = 0; hop < 32 && image.wire != nullptr; hop++) {
+			auto found = alias_ranges.find(image.wire);
+			if (found == alias_ranges.end())
+				break;
+			const AliasRange *cover = nullptr;
+			for (const AliasRange &range : found->second) {
+				if (range.offset <= image.offset && range.offset + range.width >= image.offset + image.width) {
+					cover = &range;
+					break;
+				}
+			}
+			if (cover == nullptr)
+				break;
+			image = cover->image.extract(image.offset - cover->offset, image.width);
+		}
+		return image;
+	}
+
+	// Record one wire when every bit maps onto one chunk. A wire that already
+	// has an entry is left alone.
+	void cache_uniform_wire(RTLIL::Wire *wire)
+	{
+		if (wire == nullptr || wire->width <= 1 || canon_chunk.count(wire))
+			return;
+		SigBit first(wire, 0);
+		apply(first);
+		const bool as_wire = first.wire != nullptr;
+		std::vector<RTLIL::State> consts;
+		if (!as_wire)
+			consts.push_back(first.data);
+		bool uniform = true;
+		for (int i = 1; i < wire->width; i++) {
+			SigBit bit(wire, i);
+			apply(bit);
+			if (as_wire) {
+				if (bit.wire != first.wire || bit.offset != first.offset + i) {
+					uniform = false;
+					break;
+				}
+			} else if (bit.wire != nullptr) {
+				uniform = false;
+				break;
+			} else {
+				consts.push_back(bit.data);
+			}
+		}
+		if (!uniform)
+			return;
+		if (as_wire)
+			canon_chunk.emplace(wire, RTLIL::SigChunk(first.wire, first.offset, wire->width));
+		else
+			canon_chunk.emplace(wire, RTLIL::SigChunk(RTLIL::Const(std::move(consts))));
+	}
+
+	// One entry per touched wire that still maps as a single chunk.
+	// A full-wire alias is stored without walking its bits.
+	void rebuild_canon()
+	{
+		if (canon_valid)
+			return;
+		canon_chunk.clear();
+		for (auto &it : alias_ranges) {
+			RTLIL::Wire *wire = it.first;
+			if (wire == nullptr || wire->width <= 1)
+				continue;
+			const std::vector<AliasRange> &ranges = it.second;
+			if (ranges.size() != 1)
+				continue;
+			const AliasRange &range = ranges[0];
+			if (range.offset != 0 || range.width != wire->width)
+				continue;
+			RTLIL::SigChunk image = compose_image(range.image);
+			if (image.width != wire->width)
+				continue;
+			if (image.wire != nullptr && (bit_wires.count(image.wire) ||
+					alias_overlaps(image.wire, image.offset, image.width)))
+				continue;
+			canon_chunk.emplace(wire, image);
+		}
+		for (RTLIL::Wire *wire : touched_wires)
+			cache_uniform_wire(wire);
+		canon_valid = true;
+	}
+
+	// One step of either the chunk alias or the per-bit union-find.
+	// A constant tie-off can sit on the union-find root's wire, so callers
+	// must keep stepping: stopping at the root drops that constant.
+	RTLIL::SigBit resolve_step(const RTLIL::SigBit &bit) const
+	{
+		if (!alias_ranges.empty()) {
+			if (const AliasRange *range = find_alias(bit.wire, bit.offset))
+				return alias_bit(*range, bit.offset);
+		}
+		return database.find(bit);
+	}
 
 	// Modify bit to its representative
 	void apply(RTLIL::SigBit &bit) const
 	{
-		bit = database.find(bit);
+		if (bit.wire != nullptr && !touched_wires.count(bit.wire))
+			return;
+		const RTLIL::SigBit origin = bit;
+		for (int hop = 0; hop < 4096 && bit.wire != nullptr; hop++) {
+			RTLIL::SigBit next = resolve_step(bit);
+			if (next == bit)
+				break;
+			bit = next;
+			if (!bit.wire || bit == origin)
+				break;
+		}
 	}
 
 	void apply(RTLIL::SigSpec &sig) const
 	{
-		for (auto &bit : sig)
-			apply(bit);
+		if (!sig.is_chunk()) {
+			for (auto &bit : sig)
+				apply(bit);
+			return;
+		}
+		const RTLIL::SigChunk chunk = sig.as_chunk();
+		if (chunk.wire == nullptr || !touched_wires.count(chunk.wire))
+			return;
+		auto found = canon_chunk.find(chunk.wire);
+		if (found == canon_chunk.end()) {
+			for (auto &bit : sig)
+				apply(bit);
+			return;
+		}
+		const RTLIL::SigChunk &image = found->second;
+		if (chunk.offset == 0 && chunk.width == chunk.wire->width)
+			sig = RTLIL::SigSpec(image);
+		else if (chunk.offset >= 0 && chunk.offset + chunk.width <= image.width)
+			sig = RTLIL::SigSpec(image.extract(chunk.offset, chunk.width));
+		else {
+			for (auto &bit : sig)
+				apply(bit);
+		}
 	}
 
 	RTLIL::SigBit operator()(RTLIL::SigBit bit) const
@@ -291,11 +490,21 @@ struct SigMap final : public SigMapView
 	void swap(SigMap &other)
 	{
 		database.swap(other.database);
+		touched_wires.swap(other.touched_wires);
+		bit_wires.swap(other.bit_wires);
+		alias_ranges.swap(other.alias_ranges);
+		image_users.swap(other.image_users);
+		canon_chunk.swap(other.canon_chunk);
+		std::swap(canon_valid, other.canon_valid);
 	}
 
 	void clear()
 	{
 		database.clear();
+		touched_wires.clear();
+		clear_aliases();
+		canon_chunk.clear();
+		canon_valid = false;
 	}
 
 	// Rebuild SigMap for all connections in module
@@ -306,44 +515,184 @@ struct SigMap final : public SigMapView
 			bitcount += it.first.size();
 
 		database.clear();
+		touched_wires.clear();
+		clear_aliases();
+		canon_chunk.clear();
+		canon_valid = false;
 		database.reserve(bitcount);
 
 		for (auto &it : module->connections())
 			add(it.first, it.second);
+		rebuild_canon();
 	}
 
-	// Add connections from "from" to "to", bit-by-bit
-	void add(const RTLIL::SigSpec& from, const RTLIL::SigSpec& to)
+	void merge_pair(const RTLIL::SigBit &from, const RTLIL::SigBit &to)
 	{
-		log_assert(GetSize(from) == GetSize(to));
+		if (from.wire != nullptr)
+			bit_wires.insert(from.wire);
+		if (to.wire != nullptr)
+			bit_wires.insert(to.wire);
+		touch_bit(from);
+		touch_bit(to);
+		int bfi = database.lookup(from);
+		int bti = database.lookup(to);
 
-		for (int i = 0; i < GetSize(from); i++)
-		{
-			int bfi = database.lookup(from[i]);
-			int bti = database.lookup(to[i]);
+		const RTLIL::SigBit &bf = database[bfi];
+		const RTLIL::SigBit &bt = database[bti];
 
-			const RTLIL::SigBit &bf = database[bfi];
-			const RTLIL::SigBit &bt = database[bti];
+		if (bf.wire || bt.wire) {
+			database.imerge(bfi, bti);
+			if (bf.wire == nullptr)
+				database.ipromote(bfi);
+			if (bt.wire == nullptr)
+				database.ipromote(bti);
+		}
+	}
 
-			if (bf.wire || bt.wire)
-			{
-				database.imerge(bfi, bti);
+	void forget_image_user(RTLIL::Wire *image, RTLIL::Wire *source, int source_offset)
+	{
+		if (image == nullptr)
+			return;
+		auto found = image_users.find(image);
+		if (found == image_users.end())
+			return;
+		std::vector<std::pair<RTLIL::Wire *, int>> kept;
+		for (auto &user : found->second)
+			if (user.first != source || user.second != source_offset)
+				kept.push_back(user);
+		if (kept.empty())
+			image_users.erase(image);
+		else
+			found->second.swap(kept);
+	}
 
-				if (bf.wire == nullptr)
-					database.ipromote(bfi);
+	void remember_image_user(const RTLIL::SigChunk &image, RTLIL::Wire *source, int source_offset)
+	{
+		if (image.wire != nullptr)
+			image_users[image.wire].push_back(std::make_pair(source, source_offset));
+	}
 
-				if (bt.wire == nullptr)
-					database.ipromote(bti);
+	void erase_alias(RTLIL::Wire *source, int source_offset)
+	{
+		auto found = alias_ranges.find(source);
+		if (found == alias_ranges.end())
+			return;
+		std::vector<AliasRange> kept;
+		for (AliasRange &range : found->second) {
+			if (range.offset == source_offset)
+				forget_image_user(range.image.wire, source, source_offset);
+			else
+				kept.push_back(range);
+		}
+		if (kept.empty())
+			alias_ranges.erase(source);
+		else
+			found->second.swap(kept);
+	}
+
+	void materialize_alias(RTLIL::Wire *source, const AliasRange &range)
+	{
+		for (int i = 0; i < range.width; i++) {
+			RTLIL::SigBit from(source, range.offset + i);
+			RTLIL::SigBit to = range.image.wire == nullptr
+						   ? RTLIL::SigBit(range.image.data[i])
+						   : RTLIL::SigBit(range.image.wire, range.image.offset + i);
+			merge_pair(from, to);
+		}
+		erase_alias(source, range.offset);
+	}
+
+	// Rewrite aliases whose image lies inside [wire, offset, width) so they
+	// point at replacement, which is the new image of that slice.
+	void retarget_image(RTLIL::Wire *wire, int offset, int width, const RTLIL::SigChunk &replacement)
+	{
+		auto found = image_users.find(wire);
+		if (found == image_users.end())
+			return;
+		const std::vector<std::pair<RTLIL::Wire *, int>> users = found->second;
+		for (auto user : users) {
+			auto source_ranges = alias_ranges.find(user.first);
+			if (source_ranges == alias_ranges.end())
+				continue;
+			for (size_t i = 0; i < source_ranges->second.size(); i++) {
+				AliasRange &range = source_ranges->second[i];
+				if (range.offset != user.second || range.image.wire != wire)
+					continue;
+				const bool inside = range.image.offset >= offset &&
+						    range.image.offset + range.width <= offset + width;
+				if (!inside) {
+					AliasRange copy = range;
+					materialize_alias(user.first, copy);
+					break;
+				}
+				const int delta = range.image.offset - offset;
+				forget_image_user(wire, user.first, range.offset);
+				range.image = replacement.extract(delta, range.width);
+				remember_image_user(range.image, user.first, range.offset);
+				break;
 			}
 		}
 	}
 
-	// Add sig as disconnected from anything
+	bool try_alias_chunk(const RTLIL::SigChunk &from, const RTLIL::SigChunk &to)
+	{
+		if (from.wire == nullptr || from.width != to.width || from.width <= 0)
+			return false;
+		// A wire is either aliased by ranges or stored bit by bit.
+		if (bit_wires.count(from.wire) || alias_overlaps(from.wire, from.offset, from.width)) {
+			auto found = alias_ranges.find(from.wire);
+			if (found != alias_ranges.end()) {
+				const std::vector<AliasRange> all = found->second;
+				for (const AliasRange &range : all)
+					materialize_alias(from.wire, range);
+			}
+			return false;
+		}
+
+		RTLIL::SigChunk image = compose_image(to);
+		retarget_image(from.wire, from.offset, from.width, image);
+		if (image.wire == from.wire && image.offset == from.offset && image.width == from.width)
+			return true;
+
+		touch_bit(RTLIL::SigBit(from.wire, from.offset));
+		AliasRange created{from.offset, from.width, image};
+		std::vector<AliasRange> &ranges = alias_ranges[from.wire];
+		auto insert_at = ranges.begin();
+		while (insert_at != ranges.end() && insert_at->offset < created.offset)
+			++insert_at;
+		ranges.insert(insert_at, created);
+		remember_image_user(image, from.wire, from.offset);
+		return true;
+	}
+
+	// Add connections from "from" to "to". A single untouched chunk is one
+	// range. Anything that cuts an existing range falls back to bits.
+	void add(const RTLIL::SigSpec& from, const RTLIL::SigSpec& to)
+	{
+		log_assert(GetSize(from) == GetSize(to));
+		invalidate_canon();
+		if (from.is_chunk() && to.is_chunk() && try_alias_chunk(from.as_chunk(), to.as_chunk()))
+			return;
+
+		for (int i = 0; i < GetSize(from); i++)
+			merge_pair(from[i], to[i]);
+	}
+
+	// Make bit the representative of its set when that set lives entirely in
+	// the union-find. A chunk alias past the root (a constant tie-off, or a
+	// slice tied to another wire) must stay: promoting the root would drop it.
 	void add(const RTLIL::SigBit &bit)
 	{
-		const auto &b = database.find(bit);
-		if (b.wire != nullptr)
-			database.promote(bit);
+		if (bit.wire == nullptr)
+			return;
+		RTLIL::SigBit mfp_rep = database.find(bit);
+		SigBit resolved = bit;
+		apply(resolved);
+		if (resolved != mfp_rep)
+			return;
+		if (mfp_rep.wire == nullptr)
+			return;
+		database.promote(bit);
 	}
 
 	void add(const RTLIL::SigSpec &sig)
@@ -382,12 +731,22 @@ struct SigValMap final : public SigMapView
 	void swap(SigValMap<Val> &other)
 	{
 		database.swap(other.database);
+		touched_wires.swap(other.touched_wires);
+		bit_wires.swap(other.bit_wires);
+		alias_ranges.swap(other.alias_ranges);
+		image_users.swap(other.image_users);
+		canon_chunk.swap(other.canon_chunk);
+		std::swap(canon_valid, other.canon_valid);
 		values.swap(other.values);
 	}
 
 	void clear()
 	{
 		database.clear();
+		touched_wires.clear();
+		clear_aliases();
+		canon_chunk.clear();
+		canon_valid = false;
 		values.clear();
 	}
 
@@ -399,20 +758,28 @@ struct SigValMap final : public SigMapView
 			bitcount += it.first.size();
 
 		database.clear();
+		touched_wires.clear();
+		clear_aliases();
+		canon_chunk.clear();
+		canon_valid = false;
 		values.clear();
 		database.reserve(bitcount);
 
 		for (auto &it : module->connections())
 			add(it.first, it.second);
+		rebuild_canon();
 	}
 
 	// Add connections from "from" to "to", bit-by-bit.
 	void add(const RTLIL::SigSpec& from, const RTLIL::SigSpec& to)
 	{
 		log_assert(GetSize(from) == GetSize(to));
+		invalidate_canon();
 
 		for (int i = 0; i < GetSize(from); i++)
 		{
+			touch_bit(from[i]);
+			touch_bit(to[i]);
 			int bfi = database.lookup(from[i]);
 			int bti = database.lookup(to[i]);
 			if (bfi == bti) {
