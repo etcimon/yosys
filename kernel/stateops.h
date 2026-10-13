@@ -173,6 +173,174 @@ inline void logic_not(RTLIL::State *out, const RTLIL::State *a, size_t n)
 		       : a[i] == RTLIL::State::S1 ? RTLIL::State::S0 : RTLIL::State::Sx;
 }
 
+// Summary of a whole vector in one pass: does it hold any S0, any S1, any
+// state above S1, and the parity of its S1 count. Everything the reductions and
+// the equality predicates need, so each of them is one scan.
+struct Summary {
+	bool any_zero = false, any_one = false, any_other = false;
+	unsigned ones = 0;  // count of S1 lanes modulo 2^32 (parity is what is used)
+};
+inline Summary summarize(const RTLIL::State *p, size_t n)
+{
+	Summary s;
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block zero = splat(0), one = splat(1);
+	Block z = zero, o = zero, h = zero;
+	Block ones_acc = zero;  // per-lane 0/1 accumulator, flushed before it can wrap
+	unsigned flushed = 0;
+	int pending = 0;
+	for (; i + kBlock <= n; i += kBlock) {
+		const Block v = load(p + i);
+		z |= mask(v == zero);
+		const Block is_one = mask(v == one);
+		o |= is_one;
+		h |= mask(v > one);
+		ones_acc += is_one & one;
+		if (++pending == 255) {
+			for (int k = 0; k < kBlock; k++) flushed += ones_acc[k];
+			ones_acc = zero;
+			pending = 0;
+		}
+	}
+	for (int k = 0; k < kBlock; k++) flushed += ones_acc[k];
+	s.any_zero = any(z);
+	s.any_one = any(o);
+	s.any_other = any(h);
+	s.ones = flushed;
+#endif
+	for (; i < n; i++) {
+		const RTLIL::State b = p[i];
+		if (b == RTLIL::State::S0) s.any_zero = true;
+		else if (b == RTLIL::State::S1) { s.any_one = true; s.ones++; }
+		else s.any_other = true;
+	}
+	return s;
+}
+
+// Fold of op over p[0..n) starting from the identity, as the sequential
+// per-bit fold defined it: for And an S0 anywhere gives S0, else any non-S1
+// gives Sx, else S1; Or mirrors that with S1; Xor is Sx on any non-two-state
+// lane, else the parity.
+inline RTLIL::State reduce(Op op, const RTLIL::State *p, size_t n)
+{
+	const Summary s = summarize(p, n);
+	switch (op) {
+	case Op::And:
+		if (s.any_zero) return RTLIL::State::S0;
+		return s.any_other ? RTLIL::State::Sx : RTLIL::State::S1;
+	case Op::Or:
+		if (s.any_one) return RTLIL::State::S1;
+		return s.any_other ? RTLIL::State::Sx : RTLIL::State::S0;
+	case Op::Xor:
+		if (s.any_other) return RTLIL::State::Sx;
+		return (s.ones & 1) ? RTLIL::State::S1 : RTLIL::State::S0;
+	default:
+		if (s.any_other) return RTLIL::State::Sx;
+		return (s.ones & 1) ? RTLIL::State::S0 : RTLIL::State::S1;
+	}
+}
+
+// $eq over two equal-length vectors: S0 if some lane is a definite 0/1
+// conflict, else Sx if some lane is not two-state, else S1.
+inline RTLIL::State eq_status(const RTLIL::State *a, const RTLIL::State *b, size_t n)
+{
+	bool other = false;
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block zero = splat(0), one = splat(1);
+	Block conflict = zero, h = zero;
+	for (; i + kBlock <= n; i += kBlock) {
+		const Block va = load(a + i), vb = load(b + i);
+		conflict |= (mask(va == zero) & mask(vb == one)) | (mask(va == one) & mask(vb == zero));
+		h |= mask(va > one) | mask(vb > one);
+	}
+	if (any(conflict))
+		return RTLIL::State::S0;
+	other = any(h);
+#endif
+	for (; i < n; i++) {
+		if ((a[i] == RTLIL::State::S0 && b[i] == RTLIL::State::S1) ||
+		    (a[i] == RTLIL::State::S1 && b[i] == RTLIL::State::S0))
+			return RTLIL::State::S0;
+		if (a[i] > RTLIL::State::S1 || b[i] > RTLIL::State::S1)
+			other = true;
+	}
+	return other ? RTLIL::State::Sx : RTLIL::State::S1;
+}
+
+// out[i] = a[i] == b[i] ? a[i] : Sx  ($mux with an undefined select).
+inline void merge_eq(RTLIL::State *out, const RTLIL::State *a, const RTLIL::State *b, size_t n)
+{
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block x = splat(2);
+	for (; i + kBlock <= n; i += kBlock) {
+		const Block va = load(a + i), vb = load(b + i);
+		const Block same = mask(va == vb);
+		store(out + i, (same & va) | (~same & x));
+	}
+#endif
+	for (; i < n; i++)
+		out[i] = a[i] == b[i] ? a[i] : RTLIL::State::Sx;
+}
+
+// out[i] = a[i] == b[i] ? S1 : S0  ($bweqx).
+inline void bweqx(RTLIL::State *out, const RTLIL::State *a, const RTLIL::State *b, size_t n)
+{
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block one = splat(1);
+	for (; i + kBlock <= n; i += kBlock)
+		store(out + i, mask(load(a + i) == load(b + i)) & one);
+#endif
+	for (; i < n; i++)
+		out[i] = a[i] == b[i] ? RTLIL::State::S1 : RTLIL::State::S0;
+}
+
+// $bwmux: s == S1 -> b; s == Sx and a != b -> Sx; otherwise a.
+inline void bwmux(RTLIL::State *out, const RTLIL::State *a, const RTLIL::State *b, const RTLIL::State *s, size_t n)
+{
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block one = splat(1), x = splat(2);
+	for (; i + kBlock <= n; i += kBlock) {
+		const Block va = load(a + i), vb = load(b + i), vs = load(s + i);
+		const Block sel1 = mask(vs == one);
+		const Block usex = mask(vs == x) & ~mask(va == vb);
+		const Block pick = (sel1 & vb) | (~sel1 & va);
+		store(out + i, (usex & x) | (~usex & pick));
+	}
+#endif
+	for (; i < n; i++) {
+		if (s[i] != RTLIL::State::Sx || a[i] == b[i])
+			out[i] = s[i] == RTLIL::State::S1 ? b[i] : a[i];
+		else
+			out[i] = RTLIL::State::Sx;
+	}
+}
+
+// Two cubes intersect unless some lane is two-state in both and differs
+// (BitPatternPool::match; Sa and the other states are wildcards).
+inline bool cubes_match(const RTLIL::State *a, const RTLIL::State *b, size_t n)
+{
+	size_t i = 0;
+#ifdef YOSYS_STATEOPS_SIMD
+	const Block one = splat(1);
+	Block clash = splat(0);
+	for (; i + kBlock <= n; i += kBlock) {
+		const Block va = load(a + i), vb = load(b + i);
+		clash |= mask(va <= one) & mask(vb <= one) & ~mask(va == vb);
+	}
+	if (any(clash))
+		return false;
+#endif
+	for (; i < n; i++)
+		if (a[i] <= RTLIL::State::S1 && b[i] <= RTLIL::State::S1 && a[i] != b[i])
+			return false;
+	return true;
+}
+
 } // namespace stateops
 
 YOSYS_NAMESPACE_END

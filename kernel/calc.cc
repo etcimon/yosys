@@ -23,6 +23,9 @@
 
 #include "kernel/yosys.h"
 #include "kernel/stateops.h"
+
+#include <algorithm>
+#include <cstring>
 #include "libs/bigint/BigIntegerLibrary.hh"
 
 YOSYS_NAMESPACE_BEGIN
@@ -113,13 +116,6 @@ static RTLIL::State logic_or(RTLIL::State a, RTLIL::State b)
 	return RTLIL::State::S0;
 }
 
-static RTLIL::State logic_xor(RTLIL::State a, RTLIL::State b)
-{
-	if (a != RTLIL::State::S0 && a != RTLIL::State::S1) return RTLIL::State::Sx;
-	if (b != RTLIL::State::S0 && b != RTLIL::State::S1) return RTLIL::State::Sx;
-	return a != b ? RTLIL::State::S1 : RTLIL::State::S0;
-}
-
 RTLIL::Const RTLIL::const_not(const RTLIL::Const &arg1, const RTLIL::Const&, bool signed1, bool, int result_len)
 {
 	if (result_len < 0)
@@ -174,14 +170,11 @@ RTLIL::Const RTLIL::const_xnor(const RTLIL::Const &arg1, const RTLIL::Const &arg
 	return logic_wrapper(stateops::Op::Xnor, arg1, arg2, signed1, signed2, result_len);
 }
 
-static RTLIL::Const logic_reduce_wrapper(RTLIL::State initial, RTLIL::State(*logic_func)(RTLIL::State, RTLIL::State), const RTLIL::Const &arg1, int result_len)
+// One scan over the bits (stateops::summarize) replaces the sequential fold of
+// the per-bit logic function; the result is the fold's by definition.
+static RTLIL::Const logic_reduce_wrapper(stateops::Op op, const RTLIL::Const &arg1, int result_len)
 {
-	RTLIL::State temp = initial;
-
-	for (auto i = 0; i < arg1.size(); i++)
-		temp = logic_func(temp, arg1[i]);
-
-	RTLIL::Const result(temp);
+	RTLIL::Const result(stateops::reduce(op, arg1.bit_data(), arg1.size()));
 	if (GetSize(result) < result_len)
 		result.resize(result_len, RTLIL::State::S0);
 	return result;
@@ -189,34 +182,28 @@ static RTLIL::Const logic_reduce_wrapper(RTLIL::State initial, RTLIL::State(*log
 
 RTLIL::Const RTLIL::const_reduce_and(const RTLIL::Const &arg1, const RTLIL::Const&, bool, bool, int result_len)
 {
-	return logic_reduce_wrapper(RTLIL::State::S1, logic_and, arg1, result_len);
+	return logic_reduce_wrapper(stateops::Op::And, arg1, result_len);
 }
 
 RTLIL::Const RTLIL::const_reduce_or(const RTLIL::Const &arg1, const RTLIL::Const&, bool, bool, int result_len)
 {
-	return logic_reduce_wrapper(RTLIL::State::S0, logic_or, arg1, result_len);
+	return logic_reduce_wrapper(stateops::Op::Or, arg1, result_len);
 }
 
 RTLIL::Const RTLIL::const_reduce_xor(const RTLIL::Const &arg1, const RTLIL::Const&, bool, bool, int result_len)
 {
-	return logic_reduce_wrapper(RTLIL::State::S0, logic_xor, arg1, result_len);
+	return logic_reduce_wrapper(stateops::Op::Xor, arg1, result_len);
 }
 
 RTLIL::Const RTLIL::const_reduce_xnor(const RTLIL::Const &arg1, const RTLIL::Const&, bool, bool, int result_len)
 {
-	RTLIL::Const buffer = logic_reduce_wrapper(RTLIL::State::S0, logic_xor, arg1, result_len);
-	if (!buffer.empty()) {
-		if (buffer.front() == RTLIL::State::S0)
-			buffer.set(0, RTLIL::State::S1);
-		else if (buffer.front() == RTLIL::State::S1)
-			buffer.set(0, RTLIL::State::S0);
-	}
-	return buffer;
+	// The Xor fold inverted on two-state results, Sx kept.
+	return logic_reduce_wrapper(stateops::Op::Xnor, arg1, result_len);
 }
 
 RTLIL::Const RTLIL::const_reduce_bool(const RTLIL::Const &arg1, const RTLIL::Const&, bool, bool, int result_len)
 {
-	return logic_reduce_wrapper(RTLIL::State::S0, logic_or, arg1, result_len);
+	return logic_reduce_wrapper(stateops::Op::Or, arg1, result_len);
 }
 
 RTLIL::Const RTLIL::const_logic_not(const RTLIL::Const &arg1, const RTLIL::Const&, bool signed1, bool, int result_len)
@@ -270,21 +257,30 @@ static RTLIL::Const const_shift_worker(const RTLIL::Const &arg1, const RTLIL::Co
 	if (result_len < 0)
 		result_len = GetSize(arg1);
 
-	RTLIL::Const result(RTLIL::State::Sx, result_len);
 	if (undef_bit_pos >= 0)
-		return result;
+		return RTLIL::Const(RTLIL::State::Sx, result_len);
 
-	for (int i = 0; i < result_len; i++) {
-		BigInteger pos = BigInteger(i) + offset;
-		if (pos < 0)
-			result.set(i, vacant_bits);
-		else if (pos >= BigInteger(GetSize(arg1)))
-			result.set(i, sign_ext && !arg1.empty() ? arg1.back() : vacant_bits);
-		else
-			result.set(i, arg1[pos.toInt()]);
+	// result[i] = arg1[i + offset]: vacant below position 0, the sign (or
+	// vacant) above the top. Everything in range is one contiguous copy. An
+	// amount beyond both widths puts every position out of range, which also
+	// covers amounts that do not fit a machine word.
+	const RTLIL::State high_fill = sign_ext && !arg1.empty() ? arg1.back() : vacant_bits;
+	const long size = GetSize(arg1);
+	std::vector<RTLIL::State> out(result_len, vacant_bits);
+	const BigInteger limit(result_len + size + 1);
+	if (offset >= limit) {
+		std::fill(out.begin(), out.end(), high_fill);
+	} else if (offset > -limit) {
+		const long off = offset.toLong();
+		const long lo = std::max<long>(0, -off);              // first i with i + off >= 0
+		const long hi = std::min<long>(result_len, size - off);  // first i with i + off >= size
+		if (hi > lo)
+			std::memcpy(out.data() + lo, arg1.bit_data() + lo + off, (hi - lo) * sizeof(RTLIL::State));
+		if (hi < result_len)
+			std::fill(out.begin() + std::max<long>(hi, lo), out.end(), high_fill);
 	}
 
-	return result;
+	return RTLIL::Const(std::move(out));
 }
 
 RTLIL::Const RTLIL::const_shl(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool, int result_len)
@@ -353,17 +349,7 @@ RTLIL::Const RTLIL::const_eq(const RTLIL::Const &arg1, const RTLIL::Const &arg2,
 	extend_u0(arg1_ext, width, signed1 && signed2);
 	extend_u0(arg2_ext, width, signed1 && signed2);
 
-	RTLIL::State matched_status = RTLIL::State::S1;
-	for (auto i = 0; i < arg1_ext.size(); i++) {
-		if (arg1_ext.at(i) == RTLIL::State::S0 && arg2_ext.at(i) == RTLIL::State::S1)
-			return result;
-		if (arg1_ext.at(i) == RTLIL::State::S1 && arg2_ext.at(i) == RTLIL::State::S0)
-			return result;
-		if (arg1_ext.at(i) > RTLIL::State::S1 || arg2_ext.at(i) > RTLIL::State::S1)
-			matched_status = RTLIL::State::Sx;
-	}
-
-	result.set(0, matched_status);
+	result.set(0, stateops::eq_status(arg1_ext.bit_data(), arg2_ext.bit_data(), width));
 	return result;
 }
 
@@ -387,10 +373,8 @@ RTLIL::Const RTLIL::const_eqx(const RTLIL::Const &arg1, const RTLIL::Const &arg2
 	extend_u0(arg1_ext, width, signed1 && signed2);
 	extend_u0(arg2_ext, width, signed1 && signed2);
 
-	for (auto i = 0; i < arg1_ext.size(); i++) {
-		if (arg1_ext.at(i) != arg2_ext.at(i))
-			return result;
-	}
+	if (width > 0 && std::memcmp(arg1_ext.bit_data(), arg2_ext.bit_data(), width * sizeof(RTLIL::State)) != 0)
+		return result;
 
 	result.set(0, RTLIL::State::S1);
 	return result;
@@ -603,11 +587,9 @@ RTLIL::Const RTLIL::const_mux(const RTLIL::Const &arg1, const RTLIL::Const &arg2
 	else if (arg3[0] == State::S1)
 		return arg2;
 
-	RTLIL::Const ret = arg1;
-	for (auto i = 0; i < ret.size(); i++)
-		if (ret[i] != arg2[i])
-			ret.set(i, State::Sx);
-	return ret;
+	std::vector<RTLIL::State> out(arg1.size());
+	stateops::merge_eq(out.data(), arg1.bit_data(), arg2.bit_data(), arg1.size());
+	return RTLIL::Const(std::move(out));
 }
 
 RTLIL::Const RTLIL::const_pmux(const RTLIL::Const &arg1, const RTLIL::Const &arg2, const RTLIL::Const &arg3)
@@ -679,24 +661,18 @@ RTLIL::Const RTLIL::const_demux(const RTLIL::Const &arg1, const RTLIL::Const &ar
 RTLIL::Const RTLIL::const_bweqx(const RTLIL::Const &arg1, const RTLIL::Const &arg2)
 {
 	log_assert(arg2.size() == arg1.size());
-	RTLIL::Const result(RTLIL::State::S0, arg1.size());
-	for (auto i = 0; i < arg1.size(); i++)
-		result.set(i, arg1[i] == arg2[i] ? State::S1 : State::S0);
-
-	return result;
+	std::vector<RTLIL::State> out(arg1.size());
+	stateops::bweqx(out.data(), arg1.bit_data(), arg2.bit_data(), arg1.size());
+	return RTLIL::Const(std::move(out));
 }
 
 RTLIL::Const RTLIL::const_bwmux(const RTLIL::Const &arg1, const RTLIL::Const &arg2, const RTLIL::Const &arg3)
 {
 	log_assert(arg2.size() == arg1.size());
 	log_assert(arg3.size() == arg1.size());
-	RTLIL::Const result(RTLIL::State::Sx, arg1.size());
-	for (auto i = 0; i < arg1.size(); i++) {
-		if (arg3[i] != State::Sx || arg1[i] == arg2[i])
-			result.set(i, arg3[i] == State::S1 ? arg2[i] : arg1[i]);
-	}
-
-	return result;
+	std::vector<RTLIL::State> out(arg1.size());
+	stateops::bwmux(out.data(), arg1.bit_data(), arg2.bit_data(), arg3.bit_data(), arg1.size());
+	return RTLIL::Const(std::move(out));
 }
 
 YOSYS_NAMESPACE_END

@@ -237,6 +237,124 @@ using sort_by_name_id_guard = typename std::enable_if<std::is_same<T,RTLIL::Cell
 template<typename T>
 class SigSet<T, sort_by_name_id_guard<T>> : public SigSet<T, RTLIL::sort_by_name_id<typename std::remove_pointer<T>::type>> {};
 
+/**
+ * Key store for the SigMap union-find, replacing idict<SigBit>.
+ *
+ * The profile of proc/opt_clean on the LibreCore cores is one hash lookup per bit
+ * per hop: hashing (wire, offset), one random access into the bucket table, a
+ * chain walk, then the entry. A wire's bits are consecutive integers, so the
+ * index is kept as a dense per-wire array instead: looking a bit up is one wire
+ * lookup plus an array read, and all bits of a chunk share that one lookup
+ * (see SigMapView::apply). Indices are assigned in insertion order exactly as
+ * idict's were, so iteration and every index-based caller behave the same;
+ * constant bits (wire == nullptr) keep a small hash of their own.
+ */
+struct SigBitIdict
+{
+	std::vector<RTLIL::SigBit> keys;
+	dict<RTLIL::Wire *, std::vector<int>> by_wire;
+	dict<RTLIL::SigBit, int> consts;
+
+	class const_iterator
+	{
+		friend struct SigBitIdict;
+	protected:
+		const SigBitIdict *container;
+		int index;
+		const_iterator(const SigBitIdict *container, int index) : container(container), index(index) { }
+	public:
+		typedef std::forward_iterator_tag iterator_category;
+		typedef RTLIL::SigBit value_type;
+		typedef ptrdiff_t difference_type;
+		typedef RTLIL::SigBit *pointer;
+		typedef RTLIL::SigBit &reference;
+		const_iterator() : container(nullptr), index(0) { }
+		const_iterator operator++() { index++; return *this; }
+		bool operator==(const const_iterator &other) const { return index == other.index; }
+		bool operator!=(const const_iterator &other) const { return index != other.index; }
+		const RTLIL::SigBit &operator*() const { return container->keys[index]; }
+		const RTLIL::SigBit *operator->() const { return &container->keys[index]; }
+	};
+
+	// Per-wire slot array, created on the first bit of that wire.
+	std::vector<int> &slots(RTLIL::Wire *wire)
+	{
+		auto it = by_wire.find(wire);
+		if (it != by_wire.end())
+			return it->second;
+		return by_wire.emplace(wire, std::vector<int>(wire->width, -1)).first->second;
+	}
+
+	// Index of key, inserting it as the next index when absent.
+	int operator()(const RTLIL::SigBit &key)
+	{
+		if (key.wire != nullptr) {
+			log_assert(key.offset >= 0 && key.offset < key.wire->width);
+			int &i = slots(key.wire)[key.offset];
+			if (i < 0) {
+				i = GetSize(keys);
+				keys.push_back(key);
+			}
+			return i;
+		}
+		auto it = consts.find(key);
+		if (it != consts.end())
+			return it->second;
+		consts.emplace(key, GetSize(keys));
+		keys.push_back(key);
+		return GetSize(keys) - 1;
+	}
+
+	int at(const RTLIL::SigBit &key, int defval) const
+	{
+		if (key.wire != nullptr) {
+			auto it = by_wire.find(key.wire);
+			if (it == by_wire.end())
+				return defval;
+			const int i = it->second[key.offset];
+			return i < 0 ? defval : i;
+		}
+		auto it = consts.find(key);
+		return it == consts.end() ? defval : it->second;
+	}
+
+	int at(const RTLIL::SigBit &key) const
+	{
+		const int i = at(key, -1);
+		if (i < 0)
+			throw std::out_of_range("SigBitIdict::at()");
+		return i;
+	}
+
+	int lookup(const RTLIL::SigBit &key) const { return at(key, -1); }
+	int count(const RTLIL::SigBit &key) const { return at(key, -1) < 0 ? 0 : 1; }
+
+	// The slot array of a wire, or nullptr when none of its bits is stored.
+	// Entries are -1 for bits that are not stored.
+	const int *indices(RTLIL::Wire *wire) const
+	{
+		auto it = by_wire.find(wire);
+		return it == by_wire.end() ? nullptr : it->second.data();
+	}
+
+	const RTLIL::SigBit &operator[](int index) const { return keys.at(index); }
+
+	void swap(SigBitIdict &other)
+	{
+		keys.swap(other.keys);
+		by_wire.swap(other.by_wire);
+		consts.swap(other.consts);
+	}
+	void reserve(size_t n) { keys.reserve(n); }
+	size_t size() const { return keys.size(); }
+	bool empty() const { return keys.empty(); }
+	void clear() { keys.clear(); by_wire.clear(); consts.clear(); }
+
+	const_iterator begin() const { return const_iterator(this, 0); }
+	const_iterator element(int n) const { return const_iterator(this, n); }
+	const_iterator end() const { return const_iterator(this, GetSize(keys)); }
+};
+
 struct SigMapView
 {
 	// One contiguous alias. Bit (offset + i) maps to image bit i.
@@ -246,7 +364,7 @@ struct SigMapView
 		RTLIL::SigChunk image;
 	};
 
-	mfp<SigBit> database;
+	mfp<SigBit, hash_ops<SigBit>, SigBitIdict> database;
 	// Wires with at least one bit stored in the union-find. An unaliased
 	// chunk is already canonical, so apply() must not unpack it.
 	pool<RTLIL::Wire *> touched_wires;
@@ -424,13 +542,10 @@ struct SigMapView
 		return database.find(bit);
 	}
 
-	// Modify bit to its representative
-	void apply(RTLIL::SigBit &bit) const
+	// Hops 'hop'.. of the resolution loop below, shared with the chunk walker.
+	void apply_from(RTLIL::SigBit &bit, const RTLIL::SigBit &origin, int hop) const
 	{
-		if (bit.wire != nullptr && !touched_wires.count(bit.wire))
-			return;
-		const RTLIL::SigBit origin = bit;
-		for (int hop = 0; hop < 4096 && bit.wire != nullptr; hop++) {
+		for (; hop < 4096 && bit.wire != nullptr; hop++) {
 			RTLIL::SigBit next = resolve_step(bit);
 			if (next == bit)
 				break;
@@ -438,6 +553,149 @@ struct SigMapView
 			if (!bit.wire || bit == origin)
 				break;
 		}
+	}
+
+	// Modify bit to its representative
+	void apply(RTLIL::SigBit &bit) const
+	{
+		if (bit.wire != nullptr && !touched_wires.count(bit.wire))
+			return;
+		const RTLIL::SigBit origin = bit;
+		apply_from(bit, origin, 0);
+	}
+
+	// Every bit of a touched chunk, appended to 'out', bit-for-bit what
+	// apply(SigBit&) returns.
+	//
+	// The per-bit loop hops through the alias ranges one bit at a time, and a
+	// chain of partial connections (w3 <- w2 <- w1 <- in, each a chunk alias)
+	// made every bit of a wide port pay the whole chain: one dict lookup and
+	// one binary search per hop per bit, with nothing to compress. Bits that one
+	// alias covers all land in one span of its image, so this walks spans: each
+	// hop is taken once for a run of bits, and a span that no alias covers takes
+	// the union-find step per bit with the wire's slot array looked up once.
+	// Spans are a worklist writing into their output positions, so a deep chain
+	// costs no stack. What the walk cannot reproduce exactly (an image back onto
+	// the origin wire, where the per-bit loop's cycle rule decides, or its hop
+	// budget) is replayed per bit for exactly those bits.
+	void apply_chunk(const RTLIL::SigChunk &chunk, std::vector<RTLIL::SigBit> &out) const
+	{
+		struct Span {
+			RTLIL::Wire *wire;
+			int offset;
+			int width;
+			int pos;    // first output index
+			int depth;  // hop number of these bits
+		};
+		const int start = GetSize(out);
+		if (chunk.width == 1) {
+			RTLIL::SigBit bit(chunk.wire, chunk.offset);
+			apply_from(bit, RTLIL::SigBit(chunk.wire, chunk.offset), 0);
+			out.push_back(bit);
+			return;
+		}
+		out.resize(start + chunk.width);
+		std::vector<Span> work;
+		work.push_back(Span{chunk.wire, chunk.offset, chunk.width, start, 0});
+		while (!work.empty()) {
+			const Span span = work.back();
+			work.pop_back();
+			if (span.depth >= 4096 || (span.wire == chunk.wire && span.depth > 0)) {
+				for (int k = 0; k < span.width; k++) {
+					const RTLIL::SigBit origin_bit(chunk.wire, chunk.offset + (span.pos + k - start));
+					RTLIL::SigBit bit = origin_bit;
+					apply_from(bit, origin_bit, 0);
+					out[span.pos + k] = bit;
+				}
+				continue;
+			}
+			const std::vector<AliasRange> *ranges = nullptr;
+			if (!alias_ranges.empty()) {
+				auto found = alias_ranges.find(span.wire);
+				if (found != alias_ranges.end() && !found->second.empty())
+					ranges = &found->second;
+			}
+			const int *idx = nullptr;
+			bool idx_known = false;
+			int pos = span.offset;
+			const int end = span.offset + span.width;
+			while (pos < end) {
+				const int out_pos = span.pos + (pos - span.offset);
+				const AliasRange *range = nullptr;
+				int uncovered_end = end;
+				if (ranges != nullptr) {
+					auto it = std::upper_bound(ranges->begin(), ranges->end(), pos,
+							[](int off, const AliasRange &r) { return off < r.offset; });
+					if (it != ranges->end())
+						uncovered_end = std::min(end, it->offset);
+					if (it != ranges->begin()) {
+						--it;
+						if (it->offset <= pos && pos < it->offset + it->width)
+							range = &*it;
+					}
+				}
+				if (range != nullptr) {
+					const int span_end = std::min(end, range->offset + range->width);
+					const int n = span_end - pos;
+					if (n == 1) {
+						// A single bit has nothing to share; the per-bit loop is the
+						// leaner path for it from here on.
+						const RTLIL::SigBit origin_bit(chunk.wire, chunk.offset + (out_pos - start));
+						RTLIL::SigBit bit = alias_bit(*range, pos);
+						if (bit.wire != nullptr && bit != origin_bit)
+							apply_from(bit, origin_bit, span.depth + 1);
+						out[out_pos] = bit;
+						pos = span_end;
+						continue;
+					}
+					const RTLIL::SigChunk image = range->image.extract(pos - range->offset, n);
+					if (image.wire == nullptr) {
+						for (int j = 0; j < n; j++)
+							out[out_pos + j] = RTLIL::SigBit(image.data[j]);
+					} else {
+						work.push_back(Span{image.wire, image.offset, image.width, out_pos, span.depth + 1});
+					}
+					pos = span_end;
+					continue;
+				}
+				// No alias covers [pos, uncovered_end): the union-find step per bit.
+				if (!idx_known) {
+					idx = database.store().indices(span.wire);
+					idx_known = true;
+				}
+				for (; pos < uncovered_end; pos++) {
+					const int o = span.pos + (pos - span.offset);
+					RTLIL::SigBit bit(span.wire, pos);
+					const int i = idx ? idx[pos] : -1;
+					if (i >= 0) {
+						const RTLIL::SigBit &root = database[database.ifind(i)];
+						if (root != bit) {
+							bit = root;
+							const RTLIL::SigBit origin_bit(chunk.wire, chunk.offset + (o - start));
+							if (bit.wire != nullptr && bit != origin_bit)
+								apply_from(bit, origin_bit, span.depth + 1);
+						}
+					}
+					out[o] = bit;
+				}
+			}
+		}
+	}
+
+	// Rebuild sig from its chunks, resolving the touched ones through apply_chunk.
+	void apply_by_chunks(RTLIL::SigSpec &sig) const
+	{
+		std::vector<RTLIL::SigBit> bits;
+		bits.reserve(sig.size());
+		for (auto const &chunk : sig.chunks()) {
+			if (chunk.wire == nullptr || !touched_wires.count(chunk.wire)) {
+				for (int k = 0; k < chunk.width; k++)
+					bits.push_back(chunk[k]);
+				continue;
+			}
+			apply_chunk(chunk, bits);
+		}
+		sig = RTLIL::SigSpec(bits);
 	}
 
 	void apply(RTLIL::SigSpec &sig) const
@@ -456,8 +714,7 @@ struct SigMapView
 			}
 			if (!touches)
 				return;
-			for (auto &bit : sig)
-				apply(bit);
+			apply_by_chunks(sig);
 			return;
 		}
 		const RTLIL::SigChunk chunk = sig.as_chunk();
@@ -465,8 +722,7 @@ struct SigMapView
 			return;
 		auto found = canon_chunk.find(chunk.wire);
 		if (found == canon_chunk.end()) {
-			for (auto &bit : sig)
-				apply(bit);
+			apply_by_chunks(sig);
 			return;
 		}
 		const RTLIL::SigChunk &image = found->second;
@@ -474,10 +730,8 @@ struct SigMapView
 			sig = RTLIL::SigSpec(image);
 		else if (chunk.offset >= 0 && chunk.offset + chunk.width <= image.width)
 			sig = RTLIL::SigSpec(image.extract(chunk.offset, chunk.width));
-		else {
-			for (auto &bit : sig)
-				apply(bit);
-		}
+		else
+			apply_by_chunks(sig);
 	}
 
 	RTLIL::SigBit operator()(RTLIL::SigBit bit) const

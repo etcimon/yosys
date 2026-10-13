@@ -21,6 +21,7 @@
 #define BITPATTERN_H
 
 #include "kernel/log.h"
+#include "kernel/stateops.h"
 #include "kernel/rtlil.h"
 
 YOSYS_NAMESPACE_BEGIN
@@ -126,10 +127,7 @@ struct BitPatternPool
 	{
 		log_assert(int(a.bitdata.size()) == width);
 		log_assert(int(b.bitdata.size()) == width);
-		for (int i = 0; i < width; i++)
-			if (a[i] <= RTLIL::State::S1 && b[i] <= RTLIL::State::S1 && a[i] != b[i])
-				return false;
-		return true;
+		return stateops::cubes_match(a.bitdata.data(), b.bitdata.data(), width);
 	}
 
 	/**

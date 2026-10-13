@@ -4,6 +4,8 @@
 #include "kernel/rtlil.h"
 #include "kernel/sigtools.h"
 
+#include <random>
+
 YOSYS_NAMESPACE_BEGIN
 
 class SigmapAndCheckTest : public ::testing::Test {
@@ -205,6 +207,98 @@ TEST_F(SigmapAndCheckTest, BitAtATimeAliasMatchesWholeWire)
 	bits.apply(spec);
 	for (int i = 0; i < 64; i++)
 		EXPECT_EQ(spec[i], SigBit(b, i));
+}
+
+// The span walk of apply(SigSpec&) must return, bit for bit, what the per-bit
+// loop of apply(SigBit&) returns, on random mixes of whole-wire, partial,
+// reversed, constant and self-referencing connections, including chains deep
+// enough to cross the span hop budget.
+TEST_F(SigmapAndCheckTest, SpanWalkMatchesPerBitLoop)
+{
+	std::mt19937 rng(0x51b);
+	for (int rep = 0; rep < 60; rep++) {
+		Design design;
+		Module *mod = design.addModule("\\m");
+		const int n = 6 + rng() % 40;
+		const int width = 1 + rng() % 70;
+		std::vector<Wire *> wires;
+		for (int i = 0; i < n; i++)
+			wires.push_back(mod->addWire(stringf("\\w%d", i), width));
+		const int conns = rng() % (3 * n);
+		for (int c = 0; c < conns; c++) {
+			Wire *dst = wires[rng() % n];
+			Wire *src = wires[rng() % n];
+			switch (rng() % 6) {
+			case 0: mod->connect(dst, src); break;
+			case 1: {
+				const int off = rng() % width, w = 1 + rng() % (width - off);
+				const int soff = rng() % (width - w + 1);
+				mod->connect(SigSpec(dst, off, w), SigSpec(src, soff, w));
+				break;
+			}
+			case 2: {
+				const int off = rng() % width;
+				mod->connect(SigSpec(dst, off, 1), SigSpec((rng() & 1) ? State::S1 : State::Sx));
+				break;
+			}
+			case 3: {
+				// two chunks from different wires onto one range
+				const int w = 2 + rng() % std::max(1, width - 2);
+				if (w > width) break;
+				const int off = rng() % (width - w + 1);
+				SigSpec rhs;
+				rhs.append(SigSpec(src, 0, w / 2));
+				rhs.append(SigSpec(wires[rng() % n], 0, w - w / 2));
+				mod->connect(SigSpec(dst, off, w), rhs);
+				break;
+			}
+			case 4: {
+				// deep chain: every wire's low half from the previous one
+				for (int i = 1; i < n; i++)
+					mod->connect(SigSpec(wires[i], 0, width / 2), SigSpec(wires[i - 1], width - width / 2, width / 2));
+				break;
+			}
+			default:
+				// self-referencing partial connection
+				if (width > 1) mod->connect(SigSpec(dst, 1, width - 1), SigSpec(dst, 0, width - 1));
+				break;
+			}
+		}
+		SigMap map(mod);
+		for (int q = 0; q < 40; q++) {
+			SigSpec sig;
+			const int pieces = 1 + rng() % 4;
+			for (int p = 0; p < pieces; p++) {
+				Wire *w = wires[rng() % n];
+				const int off = rng() % width;
+				sig.append(SigSpec(w, off, 1 + rng() % (width - off)));
+				if (rng() % 5 == 0) sig.append(SigSpec(State::S0, 1 + rng() % 3));
+			}
+			SigSpec spec = sig;
+			map.apply(spec);
+			ASSERT_EQ(spec.size(), sig.size());
+			for (int i = 0; i < sig.size(); i++) {
+				SigBit bit = sig[i];
+				map.apply(bit);
+				if (spec[i] != bit) {
+					std::string trace;
+					SigBit hopbit = sig[i];
+					for (int hop = 0; hop < 8; hop++) {
+						SigBit next = map.resolve_step(hopbit);
+						trace += stringf(" -> %s", log_signal(next));
+						if (next == hopbit) break;
+						hopbit = next;
+					}
+					for (auto &it : map.alias_ranges)
+						for (auto &r : it.second)
+							trace += stringf(" | alias %s[%d+%d] => %s", log_id(it.first), r.offset, r.width, log_signal(r.image));
+					ADD_FAILURE() << "rep " << rep << " query " << q << " bit " << i << " sig " << log_signal(sig)
+						<< " got " << log_signal(spec[i]) << " want " << log_signal(bit) << " trace" << trace;
+					return;
+				}
+			}
+		}
+	}
 }
 
 YOSYS_NAMESPACE_END

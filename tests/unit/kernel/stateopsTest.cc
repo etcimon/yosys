@@ -19,8 +19,10 @@
 
 #include <gtest/gtest.h>
 
+#include "kernel/bitpattern.h"
 #include "kernel/rtlil.h"
 #include "kernel/stateops.h"
+#include "libs/bigint/BigIntegerLibrary.hh"
 
 #include <random>
 
@@ -195,6 +197,186 @@ TEST(StateOpsTest, ConstEntryPoints)
 		ASSERT_EQ(sig.is_fully_ones(), o);
 		ASSERT_EQ(sig.is_fully_def(), d);
 		ASSERT_EQ(sig.is_fully_undef(), u);
+	}
+}
+
+// --- second sweep: reductions, equality, shifts, mux family, cube match ------
+
+// Sequential per-bit fold, as logic_reduce_wrapper did it.
+State ref_reduce(stateops::Op op, const std::vector<State> &v)
+{
+	State (*f)(State, State) = op == stateops::Op::And ? ref_and : op == stateops::Op::Or ? ref_or : ref_xor;
+	State t = op == stateops::Op::And ? State::S1 : State::S0;
+	for (State b : v) t = f(t, b);
+	if (op == stateops::Op::Xnor) t = t == State::S0 ? State::S1 : t == State::S1 ? State::S0 : t;
+	return t;
+}
+State ref_eq_status(const std::vector<State> &a, const std::vector<State> &b)
+{
+	State matched = State::S1;
+	for (size_t i = 0; i < a.size(); i++) {
+		if (a[i] == State::S0 && b[i] == State::S1) return State::S0;
+		if (a[i] == State::S1 && b[i] == State::S0) return State::S0;
+		if (a[i] > State::S1 || b[i] > State::S1) matched = State::Sx;
+	}
+	return matched;
+}
+// The former const_shift_worker, BigInteger position per bit.
+RTLIL::Const ref_shift_worker(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool sign_ext, bool signed2, int direction,
+                              int result_len, State vacant_bits = State::S0)
+{
+	int undef_bit_pos = -1;
+	BigUnsigned mag;
+	BigInteger::Sign sign = BigInteger::positive;
+	State inv_sign_bit = State::S1;
+	int num_bits = arg2.size();
+	if (signed2 && num_bits && arg2[num_bits - 1] == State::S1) {
+		inv_sign_bit = State::S0;
+		sign = BigInteger::negative;
+		num_bits--;
+	}
+	for (int i = 0; i < num_bits; i++)
+		if (arg2[i] == State::S0 || arg2[i] == State::S1)
+			mag.setBit(i, arg2[i] == inv_sign_bit);
+		else if (undef_bit_pos < 0)
+			undef_bit_pos = i;
+	if (sign == BigInteger::negative) mag += 1;
+	BigInteger offset = BigInteger(mag, sign) * direction;
+	if (result_len < 0) result_len = arg1.size();
+	RTLIL::Const result(State::Sx, result_len);
+	if (undef_bit_pos >= 0) return result;
+	for (int i = 0; i < result_len; i++) {
+		BigInteger pos = BigInteger(i) + offset;
+		if (pos < 0)
+			result.set(i, vacant_bits);
+		else if (pos >= BigInteger(arg1.size()))
+			result.set(i, sign_ext && !arg1.empty() ? arg1.back() : vacant_bits);
+		else
+			result.set(i, arg1[pos.toInt()]);
+	}
+	return result;
+}
+
+TEST(StateOpsTest, ReduceAndEqEveryLane)
+{
+	const size_t n = 100;
+	for (State odd : kStates) {
+		for (State base : {State::S0, State::S1}) {
+			for (size_t lane = 0; lane < n; lane++) {
+				std::vector<State> v(n, base);
+				v[lane] = odd;
+				for (stateops::Op op : {stateops::Op::And, stateops::Op::Or, stateops::Op::Xor, stateops::Op::Xnor})
+					ASSERT_EQ(stateops::reduce(op, v.data(), n), ref_reduce(op, v)) << "op " << int(op) << " lane " << lane;
+				std::vector<State> w(n, base);
+				for (State other : kStates) {
+					w[lane] = other;
+					ASSERT_EQ(stateops::eq_status(v.data(), w.data(), n), ref_eq_status(v, w)) << "lane " << lane;
+					ASSERT_EQ(stateops::cubes_match(v.data(), w.data(), n),
+					          !(v[lane] <= State::S1 && w[lane] <= State::S1 && v[lane] != w[lane]) || false)
+						<< "cube lane " << lane;
+				}
+			}
+		}
+	}
+	// parity across block boundaries: 1..300 ones
+	for (size_t ones = 0; ones < 300; ones++) {
+		std::vector<State> v(300, State::S0);
+		for (size_t i = 0; i < ones; i++) v[i * 7 % 300] = State::S1;
+		ASSERT_EQ(stateops::reduce(stateops::Op::Xor, v.data(), 300), ref_reduce(stateops::Op::Xor, v));
+	}
+}
+
+TEST(StateOpsTest, ShiftWorkerAgainstBigIntegerReference)
+{
+	std::mt19937 rng(0x5417);
+	for (int rep = 0; rep < 2000; rep++) {
+		const int la = rng() % 120;
+		RTLIL::Const a(State::S0, la);
+		for (int i = 0; i < la; i++) a.set(i, kStates[rng() % 4]);
+		// shift amounts: small, around the width, huge (does not fit a word), undefined
+		RTLIL::Const b;
+		switch (rng() % 4) {
+		case 0: b = RTLIL::Const(int(rng() % 140), 8 + rng() % 8); break;
+		case 1: b = RTLIL::Const(int(rng() % 8), 3); break;
+		case 2: {
+			b = RTLIL::Const(State::S0, 70);
+			b.set(69, State::S1);  // 2^69 (or very negative when signed)
+			if (rng() & 1) b.set(rng() % 69, State::S1);
+			break;
+		}
+		default:
+			b = RTLIL::Const(int(rng() % 140), 10);
+			b.set(rng() % 10, kStates[2 + rng() % 4]);  // an undefined select bit
+			break;
+		}
+		const bool signed2 = rng() & 1, sign_ext = rng() & 1;
+		const int direction = (rng() & 1) ? 1 : -1;
+		// const_shl/shr/shift extend to result_len before the worker, so the public
+		// contract is result_len >= 0 (a negative one asserts in Const::resize).
+		const int result_len = int(rng() % 150);
+		const State vacant = (rng() & 1) ? State::S0 : State::Sx;
+		// public entry points cover the worker; compare each against the reference
+		struct { RTLIL::Const (*fn)(const RTLIL::Const &, const RTLIL::Const &, bool, bool, int); } fns[] = {
+			{RTLIL::const_shl}, {RTLIL::const_shr}, {RTLIL::const_sshl}, {RTLIL::const_sshr}, {RTLIL::const_shift}, {RTLIL::const_shiftx}};
+		const bool s1 = rng() & 1;
+		const int rl = result_len < 0 ? la : result_len;
+		auto ext = [&](const RTLIL::Const &c, int w, bool s) { RTLIL::Const e = c; e.resize(w, (e.size() > 0 && s) ? e.back() : State::S0); return e; };
+		RTLIL::Const exp[6] = {
+			ref_shift_worker(ext(a, rl, s1), b, false, false, -1, rl),
+			ref_shift_worker(ext(a, std::max(rl, la), s1), b, false, false, +1, rl),
+			ref_shift_worker(a, b, s1, false, -1, rl),
+			ref_shift_worker(a, b, s1, false, +1, rl),
+			ref_shift_worker(ext(a, std::max(rl, la), s1), b, false, signed2, +1, rl),
+			ref_shift_worker(a, b, false, signed2, +1, rl, State::Sx)};
+		for (int k = 0; k < 6; k++) {
+			RTLIL::Const got = fns[k].fn(a, b, s1, signed2, result_len);
+			ASSERT_EQ(got.size(), exp[k].size()) << "fn " << k << " rep " << rep;
+			for (int i = 0; i < got.size(); i++)
+				ASSERT_EQ(got[i], exp[k][i]) << "fn " << k << " rep " << rep << " bit " << i;
+		}
+		(void)sign_ext; (void)direction; (void)vacant;
+	}
+}
+
+TEST(StateOpsTest, MuxFamilyAndCubes)
+{
+	std::mt19937 rng(0x3a3a);
+	for (int rep = 0; rep < 300; rep++) {
+		const int n = rng() % 200;
+		RTLIL::Const a(State::S0, n), b(State::S0, n), s(State::S0, n);
+		for (int i = 0; i < n; i++) { a.set(i, kStates[rng() % 6]); b.set(i, kStates[rng() % 6]); s.set(i, kStates[rng() % 6]); }
+		RTLIL::Const mux = RTLIL::const_mux(a, b, RTLIL::Const(State::Sx, 1));
+		RTLIL::Const weq = RTLIL::const_bweqx(a, b);
+		RTLIL::Const wmux = RTLIL::const_bwmux(a, b, s);
+		ASSERT_EQ(mux.size(), n);
+		for (int i = 0; i < n; i++) {
+			ASSERT_EQ(mux[i], a[i] == b[i] ? a[i] : State::Sx) << "mux bit " << i;
+			ASSERT_EQ(weq[i], a[i] == b[i] ? State::S1 : State::S0) << "bweqx bit " << i;
+			State ref = State::Sx;
+			if (s[i] != State::Sx || a[i] == b[i]) ref = s[i] == State::S1 ? b[i] : a[i];
+			ASSERT_EQ(wmux[i], ref) << "bwmux bit " << i;
+		}
+		// $eq / $ne / $eqx / $nex entry points
+		const bool sa = rng() & 1, sb = rng() & 1;
+		const int w = std::max(a.size(), b.size());
+		auto ext = [&](const RTLIL::Const &c) { RTLIL::Const e = c; e.resize(w, (e.size() > 0 && (sa && sb)) ? e.back() : State::S0); return e; };
+		const State eq = ref_eq_status(ext(a).to_bits(), ext(b).to_bits());
+		ASSERT_EQ(RTLIL::const_eq(a, b, sa, sb, 1)[0], eq);
+		const State ne = eq == State::S0 ? State::S1 : eq == State::S1 ? State::S0 : eq;
+		ASSERT_EQ(RTLIL::const_ne(a, b, sa, sb, 1)[0], ne);
+		ASSERT_EQ(RTLIL::const_eqx(a, b, sa, sb, 1)[0], ext(a).to_bits() == ext(b).to_bits() ? State::S1 : State::S0);
+		// BitPatternPool::match through the pool API: the full pool intersects any
+		// two-state cube; after taking that cube out, the cube itself is gone.
+		if (n > 0) {
+			RTLIL::Const two(State::S0, n);
+			for (int i = 0; i < n; i++) two.set(i, (rng() & 1) ? State::S1 : State::S0);
+			BitPatternPool pool(n);
+			RTLIL::SigSpec sig(two);
+			ASSERT_TRUE(pool.has_any(sig));
+			ASSERT_TRUE(pool.has_all(sig));
+			ASSERT_TRUE(pool.take(sig));
+			ASSERT_FALSE(pool.has_any(sig));
+		}
 	}
 }
 
