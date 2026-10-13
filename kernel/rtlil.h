@@ -1098,6 +1098,13 @@ public:
 	std::string as_string(const char* any = "-") const;
 	static Const from_string(const std::string &str);
 	std::vector<RTLIL::State> to_bits() const;
+	// Contiguous read-only view of the bits, size() states long, for the lane
+	// kernels in kernel/stateops.h (a string-backed constant is bitvectorized
+	// first). Everything else should keep using operator[] / set().
+	const RTLIL::State *bit_data() const {
+		const_cast<Const*>(this)->bitvectorize_internal();
+		return get_bits().data();
+	}
 
 	std::string decode_string() const;
 	int size() const;

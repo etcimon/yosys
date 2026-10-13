@@ -1,0 +1,15 @@
+# One real loop must not make check walk every bit of the wide cones around it.
+read_verilog <<EOT
+module top(input [1023:0] a, b, input one, output [1023:0] y0, y1, y2, y3, output loop);
+  assign y0 = a & b;
+  assign y1 = a & b;
+  assign y2 = a & b;
+  assign y3 = a & b;
+  assign loop = loop ^ one;
+endmodule
+EOT
+hierarchy -top top
+proc
+logger -expect warning "found logic loop.*" 1
+check
+logger -check-expected

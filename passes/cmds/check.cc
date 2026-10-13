@@ -490,8 +490,10 @@ struct CheckPass : public Pass {
 
 				void add_edge(RTLIL::Cell *cell, RTLIL::IdString from_port, int from_bit,
 							  RTLIL::IdString to_port, int to_bit, int) override {
-					SigSpec from_portsig = cell->getPort(from_port);
-					SigSpec to_portsig = cell->getPort(to_port);
+					// Const operator[] does not unpack. A writable copy would
+					// unpack the whole port once per bit.
+					const SigSpec &from_portsig = cell->getPort(from_port);
+					const SigSpec &to_portsig = cell->getPort(to_port);
 					log_assert(from_bit >= 0 && from_bit < from_portsig.size());
 					log_assert(to_bit >= 0 && to_bit < to_portsig.size());
 					SigBit from = sigmap(from_portsig[from_bit]);
@@ -543,6 +545,21 @@ struct CheckPass : public Pass {
 					return false;
 				}
 
+				bool port_can_be_live(const SigSpec &raw) const
+				{
+					if (!live_wires)
+						return true;
+					auto hit = [&](RTLIL::Wire *wire) {
+						return wire != nullptr && (live_wires->count(wire->name) || sigmap.touched_wires.count(wire));
+					};
+					if (raw.is_chunk())
+						return hit(raw.as_chunk().wire);
+					for (auto const &chunk : raw.chunks())
+						if (hit(chunk.wire))
+							return true;
+					return false;
+				}
+
 				bool add_edges_from_cell(Cell *cell) {
 					// The wire filter never needs a per-bit edge list. One edge per
 					// connected wire is enough to decide which wires can be in a loop.
@@ -566,25 +583,51 @@ struct CheckPass : public Pass {
 						return true;
 					}
 
+					// Detailed edges index every port bit. A cell whose wires are
+					// outside the coarse cycle cannot add a bit edge.
+					if (live_wires) {
+						bool hits = false;
+						for (auto &conn : cell->connections()) {
+							if (port_can_be_live(conn.second)) {
+								hits = true;
+								break;
+							}
+						}
+						if (!hits)
+							return true;
+					}
+
 					if (force_detail || !detail_costly(cell)) {
 						if (AbstractCellEdgesDatabase::add_edges_from_cell(cell))
 							return true;
 					}
 
 					// Bit fallback for cells whose detailed edges would be quadratic.
+					// A wire that is not in the coarse cycle contributes no edge.
+					// Skip the chunk before visiting its bits.
 					{
+						auto add_port_bits = [&](const SigSpec &raw, bool as_output) {
+							SigSpec sig = sigmap(raw);
+							for (auto const &chunk : sig.chunks()) {
+								if (chunk.wire == nullptr)
+									continue;
+								if (live_wires && !live_wires->count(chunk.wire->name))
+									continue;
+								for (int i = 0; i < chunk.width; i++) {
+									std::pair<RTLIL::IdString, int> bit_node(chunk.wire->name, chunk.offset + i);
+									std::pair<RTLIL::IdString, int> cell_node(cell->name, -1);
+									if (as_output)
+										bit_topo->edge(cell_node, bit_node);
+									else
+										bit_topo->edge(bit_node, cell_node);
+								}
+							}
+						};
 						for (auto &conn : cell->connections()) {
 							if (cell->input(conn.first))
-							for (auto bit : sigmap(conn.second))
-							if (wire_kept(bit))
-								bit_topo->edge(std::make_pair(bit.wire->name, bit.offset),
-										std::make_pair(cell->name, -1));
-
+								add_port_bits(conn.second, false);
 							if (cell->output(conn.first))
-							for (auto bit : sigmap(conn.second))
-							if (wire_kept(bit))
-								bit_topo->edge(std::make_pair(cell->name, -1),
-										std::make_pair(bit.wire->name, bit.offset));
+								add_port_bits(conn.second, true);
 						}
 					}
 

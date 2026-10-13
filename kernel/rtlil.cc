@@ -21,6 +21,7 @@
 #include "kernel/macc.h"
 #include "kernel/newcelltypes.h"
 #include "kernel/sigtools.h"
+#include "kernel/stateops.h"
 #include "kernel/threading.h"
 #include "frontends/verilog/verilog_frontend.h"
 #include "frontends/verilog/preproc.h"
@@ -797,12 +798,7 @@ bool RTLIL::Const::is_fully_zero() const
 	}
 
 	const bitvectype& bv = get_bits();
-
-	for (const auto &bit : bv)
-		if (bit != RTLIL::State::S0)
-			return false;
-
-	return true;
+	return stateops::all_in(bv.data(), bv.size(), RTLIL::State::S0, RTLIL::State::S0);
 }
 
 bool RTLIL::Const::is_fully_ones() const
@@ -815,11 +811,7 @@ bool RTLIL::Const::is_fully_ones() const
 	}
 
 	const bitvectype& bv = get_bits();
-	for (const auto &bit : bv)
-		if (bit != RTLIL::State::S1)
-			return false;
-
-	return true;
+	return stateops::all_in(bv.data(), bv.size(), RTLIL::State::S1, RTLIL::State::S1);
 }
 
 bool RTLIL::Const::is_fully_def() const
@@ -828,11 +820,7 @@ bool RTLIL::Const::is_fully_def() const
 		return true;
 
 	const bitvectype& bv = get_bits();
-	for (const auto &bit : bv)
-		if (bit != RTLIL::State::S0 && bit != RTLIL::State::S1)
-			return false;
-
-	return true;
+	return stateops::all_in(bv.data(), bv.size(), RTLIL::State::S0, RTLIL::State::S1);
 }
 
 bool RTLIL::Const::is_fully_undef() const
@@ -841,11 +829,7 @@ bool RTLIL::Const::is_fully_undef() const
 		return str->empty();
 
 	const bitvectype& bv = get_bits();
-	for (const auto &bit : bv)
-		if (bit != RTLIL::State::Sx && bit != RTLIL::State::Sz)
-			return false;
-
-	return true;
+	return stateops::all_in(bv.data(), bv.size(), RTLIL::State::Sx, RTLIL::State::Sz);
 }
 
 bool RTLIL::Const::is_fully_undef_x_only() const
@@ -854,11 +838,7 @@ bool RTLIL::Const::is_fully_undef_x_only() const
 		return str->empty();
 
 	const bitvectype& bv = get_bits();
-	for (const auto &bit : bv)
-		if (bit != RTLIL::State::Sx)
-			return false;
-
-	return true;
+	return stateops::all_in(bv.data(), bv.size(), RTLIL::State::Sx, RTLIL::State::Sx);
 }
 
 bool RTLIL::Const::is_onehot(int *pos) const
@@ -5497,9 +5477,8 @@ bool RTLIL::SigSpec::is_fully_zero() const
 	for (auto &chunk : chunks()) {
 		if (chunk.width > 0 && chunk.wire != NULL)
 			return false;
-		for (RTLIL::State d : chunk.data)
-			if (d != RTLIL::State::S0)
-				return false;
+		if (!stateops::all_in(chunk.data.data(), chunk.data.size(), RTLIL::State::S0, RTLIL::State::S0))
+			return false;
 	}
 	return true;
 }
@@ -5509,9 +5488,8 @@ bool RTLIL::SigSpec::is_fully_ones() const
 	for (auto &chunk : chunks()) {
 		if (chunk.width > 0 && chunk.wire != NULL)
 			return false;
-		for (RTLIL::State d : chunk.data)
-			if (d != RTLIL::State::S1)
-				return false;
+		if (!stateops::all_in(chunk.data.data(), chunk.data.size(), RTLIL::State::S1, RTLIL::State::S1))
+			return false;
 	}
 	return true;
 }
@@ -5521,9 +5499,8 @@ bool RTLIL::SigSpec::is_fully_def() const
 	for (auto &chunk : chunks()) {
 		if (chunk.width > 0 && chunk.wire != NULL)
 			return false;
-		for (RTLIL::State d : chunk.data)
-			if (d != RTLIL::State::S0 && d != RTLIL::State::S1)
-				return false;
+		if (!stateops::all_in(chunk.data.data(), chunk.data.size(), RTLIL::State::S0, RTLIL::State::S1))
+			return false;
 	}
 	return true;
 }
@@ -5533,9 +5510,8 @@ bool RTLIL::SigSpec::is_fully_undef() const
 	for (auto &chunk : chunks()) {
 		if (chunk.width > 0 && chunk.wire != NULL)
 			return false;
-		for (RTLIL::State d : chunk.data)
-			if (d != RTLIL::State::Sx && d != RTLIL::State::Sz)
-				return false;
+		if (!stateops::all_in(chunk.data.data(), chunk.data.size(), RTLIL::State::Sx, RTLIL::State::Sz))
+			return false;
 	}
 	return true;
 }

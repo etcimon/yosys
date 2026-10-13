@@ -73,6 +73,7 @@ yosys_core(kernel
 	sexpr.cc
 	sexpr.h
 	sigtools.h
+	stateops.h
 	tclapi.cc
 	threading.cc
 	threading.h
@@ -141,6 +142,7 @@ yosys_core(kernel
 		scopeinfo.h
 		sexpr.h
 		sigtools.h
+		stateops.h
 		threading.h
 		timinginfo.h
 		unused_bits.h

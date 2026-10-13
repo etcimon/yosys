@@ -184,4 +184,27 @@ TEST_F(SigmapAndCheckTest, SliceAliasSurvivesPromote)
 	EXPECT_EQ(map(SigBit(temp, 0)), SigBit(x, 0));
 }
 
+// opt_clean used to add one bit at a time. Adjacent bits of one wire must
+// stay one alias, and a whole-wire apply must still name the target wire.
+TEST_F(SigmapAndCheckTest, BitAtATimeAliasMatchesWholeWire)
+{
+	Design design;
+	Module *mod = design.addModule("\\m");
+	Wire *a = mod->addWire("\\a", 64);
+	Wire *b = mod->addWire("\\b", 64);
+	SigMap bits;
+	for (int i = 0; i < 64; i++)
+		bits.add(SigBit(a, i), SigBit(b, i));
+	SigMap whole(mod);
+	mod->connect(a, b);
+	whole.set(mod);
+
+	for (int i = 0; i < 64; i++)
+		EXPECT_EQ(bits(SigBit(a, i)), whole(SigBit(a, i)));
+	SigSpec spec(a);
+	bits.apply(spec);
+	for (int i = 0; i < 64; i++)
+		EXPECT_EQ(spec[i], SigBit(b, i));
+}
+
 YOSYS_NAMESPACE_END

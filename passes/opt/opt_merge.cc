@@ -108,9 +108,53 @@ struct OptMergeThreadWorker
 	bool mode_share_all;
 	bool mode_keepdc;
 
-	// Lane i is B[i*width +: width]. Built from chunks so a wide data word is
-	// not walked bit by bit. The lane SigSpec matches SigSpec::extract, so the
-	// hash stays the same for equal muxes.
+	// Lane i is B[i*width +: width]. Equality still builds the lane SigSpec,
+	// which matches SigSpec::extract. Hashing only feeds the coalesced chunks
+	// to the hasher, so a wide data word is not copied into one SigSpec per lane.
+	static void eat_chunk(Hasher &h, const RTLIL::SigChunk &chunk)
+	{
+		if (chunk.wire == nullptr) {
+			for (auto const &bit : chunk.data)
+				h.eat(bit);
+		} else {
+			h.eat(chunk.wire->name.index_);
+			h.eat(chunk.offset);
+			h.eat(chunk.width);
+		}
+	}
+
+	static Hasher hash_pmux_in(const SigSpec& sig_s, const SigSpec& sig_b, Hasher h)
+	{
+		int s_width = GetSize(sig_s);
+		int width = s_width ? GetSize(sig_b) / s_width : 0;
+		if (s_width <= 0 || width <= 0)
+			return h;
+		hashlib::commutative_hash comm;
+		int lane = 0;
+		int filled = 0;
+		Hasher lane_h;
+		for (auto const &chunk : sig_b.chunks()) {
+			int local = 0;
+			while (local < chunk.width && lane < s_width) {
+				int take = std::min(chunk.width - local, width - filled);
+				eat_chunk(lane_h, chunk.extract(local, take));
+				local += take;
+				filled += take;
+				if (filled == width) {
+					Hasher id;
+					id.eat(sig_s[lane]);
+					id.eat(lane_h.yield() == 0 ? Hasher::hash_t{1} : lane_h.yield());
+					comm.eat(id);
+					lane++;
+					filled = 0;
+					lane_h = Hasher();
+				}
+			}
+		}
+		log_assert(lane == s_width);
+		return comm.hash_into(h);
+	}
+
 	static std::vector<SigSpec> pmux_lanes(const SigSpec &sig_b, int s_width, int width)
 	{
 		std::vector<SigSpec> lanes(s_width);
@@ -137,17 +181,6 @@ struct OptMergeThreadWorker
 			}
 		}
 		return lanes;
-	}
-
-	static Hasher hash_pmux_in(const SigSpec& sig_s, const SigSpec& sig_b, Hasher h)
-	{
-		int s_width = GetSize(sig_s);
-		int width = s_width ? GetSize(sig_b) / s_width : 0;
-		hashlib::commutative_hash comm;
-		std::vector<SigSpec> lanes = pmux_lanes(sig_b, s_width, width);
-		for (int i = 0; i < s_width; i++)
-			comm.eat(hash_pair(sig_s[i], lanes[i]));
-		return comm.hash_into(h);
 	}
 
 	static void sort_pmux_conn(dict<RTLIL::IdString, RTLIL::SigSpec> &conn)
@@ -447,20 +480,32 @@ struct OptMergeWorker
 		// of the redirected wires, so later rounds rehash that set.
 		dict<RTLIL::Cell *, Hasher::hash_t> cell_hash;
 		dict<RTLIL::Wire *, std::vector<RTLIL::Cell *>> wire_cells;
-		dict<RTLIL::Cell *, pool<RTLIL::Wire *>> cell_wires;
+		dict<RTLIL::Cell *, dict<RTLIL::Wire *, int>> cell_wires;
 		pool<RTLIL::Cell *> dirty_cells;
+		std::vector<std::vector<std::pair<int, RTLIL::Wire *>>> pending_wire_uses;
 
 		auto watch = [&](RTLIL::Cell *cell, RTLIL::Wire *wire) {
-			if (cell_wires[cell].insert(wire).second)
-				wire_cells[wire].push_back(cell);
+			auto inserted = cell_wires[cell].emplace(wire, 0);
+			if (inserted.second) {
+				auto &users = wire_cells[wire];
+				inserted.first->second = GetSize(users);
+				users.push_back(cell);
+			}
 		};
 		auto unwatch = [&](RTLIL::Cell *cell) {
 			auto found = cell_wires.find(cell);
 			if (found == cell_wires.end())
 				return;
-			for (auto wire : found->second) {
-				auto &users = wire_cells[wire];
-				users.erase(std::remove(users.begin(), users.end(), cell), users.end());
+			for (auto const &use : found->second) {
+				auto &users = wire_cells.at(use.first);
+				log_assert(users.at(use.second) == cell);
+				RTLIL::Cell *moved = users.back();
+				users[use.second] = moved;
+				users.pop_back();
+				if (moved != cell)
+					cell_wires.at(moved).at(use.first) = use.second;
+				if (users.empty())
+					wire_cells.erase(use.first);
 			}
 			cell_wires.erase(found);
 		};
@@ -509,6 +554,11 @@ struct OptMergeWorker
 
 			int cells_size = module->cells_size();
 			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
+			// Workers hash a range and then block on the shard queue. Only the
+			// iteration that pushed those ranges may push shards. A later pass
+			// rehashes on this thread; pushing shards then deadlocks, because
+			// the workers are waiting for the next range instead.
+			bool threaded_hash = false;
 			if (cell_hash.empty()) {
 				log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
 				int cell_index = 0;
@@ -519,11 +569,12 @@ struct OptMergeWorker
 						int num_cells = cells_size/workers + ((i < cells_size_mod_workers) ? 1 : 0);
 						CellRange c = { cell_index, cell_index + num_cells };
 						cell_index += num_cells;
-						if (num_worker_threads > 0)
+						if (num_worker_threads > 0) {
+							threaded_hash = true;
 							cell_ranges_queues[i].push_back(c);
-						else {
+						} else {
 							CellHashes got = thread_worker.compute_cell_hashes(c);
-							absorb_wires(got.wire_uses);
+							pending_wire_uses.push_back(std::move(got.wire_uses));
 							sharded_bucketed_cell_hashes[i] = std::move(got.bucketed_cell_hashes);
 						}
 					}
@@ -531,7 +582,7 @@ struct OptMergeWorker
 					if (num_worker_threads > 0)
 						for (int i = 0; i < workers; ++i) {
 							CellHashes got = std::move(*cell_hashes_queues[i].pop_front());
-							absorb_wires(got.wire_uses);
+							pending_wire_uses.push_back(std::move(got.wire_uses));
 							sharded_bucketed_cell_hashes[i] = std::move(got.bucketed_cell_hashes);
 						}
 				}
@@ -557,14 +608,14 @@ struct OptMergeWorker
 				Multithreading multithreading;
 				for (int i = 0; i < workers; ++i) {
 					Shards thread_shards = { sharded_bucketed_cell_hashes };
-					if (num_worker_threads > 0)
+					if (threaded_hash)
 						shards_queues[i].push_back(thread_shards);
 					else {
 						std::vector<DuplicateCell> d = std::move(thread_worker.find_duplicate_cells(i, thread_shards).duplicates);
 						merged_duplicates.insert(merged_duplicates.end(), d.begin(), d.end());
 					}
 				}
-				if (num_worker_threads > 0)
+				if (threaded_hash)
 					for (int i = 0; i < workers; ++i) {
 						std::vector<DuplicateCell> d = std::move(duplicates_queues[i].pop_front()->duplicates);
 						merged_duplicates.insert(merged_duplicates.end(), d.begin(), d.end());
@@ -576,6 +627,11 @@ struct OptMergeWorker
 				// cells involved.
 				return std::max(lhs.remove_cell, lhs.keep_cell) < std::max(rhs.remove_cell, rhs.keep_cell);
 			});
+
+			if (!merged_duplicates.empty())
+				for (const auto &uses : pending_wire_uses)
+					absorb_wires(uses);
+			pending_wire_uses.clear();
 
 			// Convert to cell pointers because removing cells will invalidate the indices.
 			std::vector<std::pair<RTLIL::Cell*, RTLIL::Cell*>> cell_ptrs;

@@ -28,12 +28,35 @@ unsigned int hash_bit(const SigBit &bit) {
 	return static_cast<unsigned int>(hash_ops<SigBit>::hash(bit).yield());
 }
 
+// Slice without SigSpec::extract. That walks every bit even when the source is one wire.
+SigSpec wire_slice(const SigSpec &sig, int offset, int length)
+{
+	if (length <= 0)
+		return {};
+	if (sig.is_chunk()) {
+		SigChunk chunk = sig.as_chunk();
+		if (chunk.wire != nullptr)
+			return SigChunk(chunk.wire, chunk.offset + offset, length);
+	}
+	return sig.extract(offset, length);
+}
+
+// Same connections as adding each wire bit, but a whole wire stays one alias range.
+// One range per bit made opt_clean quadratic in the wire width.
 SigMap wire_sigmap(const RTLIL::Module* mod) {
 	SigMap map;
 	for (auto &it : mod->connections_) {
-		for (int i = 0; i < GetSize(it.second); i++) {
-			if (it.second[i].wire != nullptr)
-				map.add(it.first[i], it.second[i]);
+		const SigSpec &lhs = it.first;
+		const SigSpec &rhs = it.second;
+		if (lhs.is_chunk() && rhs.is_chunk() && rhs.as_chunk().wire != nullptr) {
+			map.add(lhs, rhs);
+			continue;
+		}
+		int at = 0;
+		for (auto const &chunk : rhs.chunks()) {
+			if (chunk.wire != nullptr)
+				map.add(wire_slice(lhs, at, chunk.width), SigSpec(chunk));
+			at += chunk.width;
 		}
 	}
 	return map;

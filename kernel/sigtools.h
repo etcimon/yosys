@@ -442,7 +442,20 @@ struct SigMapView
 
 	void apply(RTLIL::SigSpec &sig) const
 	{
+		// Nothing in this module was connected. A multi-chunk signal is already
+		// canonical, and walking its bits is what made wide $pmux ports slower.
+		if (touched_wires.empty())
+			return;
 		if (!sig.is_chunk()) {
+			bool touches = false;
+			for (auto const &chunk : sig.chunks()) {
+				if (chunk.wire != nullptr && touched_wires.count(chunk.wire)) {
+					touches = true;
+					break;
+				}
+			}
+			if (!touches)
+				return;
 			for (auto &bit : sig)
 				apply(bit);
 			return;
@@ -672,12 +685,56 @@ struct SigMap final : public SigMapView
 		touch_bit(RTLIL::SigBit(from.wire, from.offset));
 		AliasRange created{from.offset, from.width, image};
 		std::vector<AliasRange> &ranges = alias_ranges[from.wire];
-		auto insert_at = ranges.begin();
-		while (insert_at != ranges.end() && insert_at->offset < created.offset)
-			++insert_at;
-		ranges.insert(insert_at, created);
-		remember_image_user(image, from.wire, from.offset);
+		// Bit-at-a-time callers (opt_clean's wire map) append the next offset.
+		// A linear scan from begin() on each insert is quadratic in the width.
+		auto insert_at = std::lower_bound(ranges.begin(), ranges.end(), created.offset,
+				[](const AliasRange &range, int off) { return range.offset < off; });
+		if (insert_at != ranges.begin()) {
+			auto prev = insert_at - 1;
+			if (prev->offset + prev->width == created.offset && images_abut(prev->image, created.image)) {
+				extend_image(prev->image, created.image);
+				prev->width += created.width;
+				while (insert_at != ranges.end() &&
+						prev->offset + prev->width == insert_at->offset &&
+						images_abut(prev->image, insert_at->image)) {
+					forget_image_user(insert_at->image.wire, from.wire, insert_at->offset);
+					extend_image(prev->image, insert_at->image);
+					prev->width += insert_at->width;
+					insert_at = ranges.erase(insert_at);
+				}
+				return true;
+			}
+		}
+		insert_at = ranges.insert(insert_at, created);
+		remember_image_user(insert_at->image, from.wire, insert_at->offset);
+		auto next = insert_at + 1;
+		while (next != ranges.end() &&
+				insert_at->offset + insert_at->width == next->offset &&
+				images_abut(insert_at->image, next->image)) {
+			forget_image_user(next->image.wire, from.wire, next->offset);
+			extend_image(insert_at->image, next->image);
+			insert_at->width += next->width;
+			next = ranges.erase(next);
+		}
 		return true;
+	}
+
+	static bool images_abut(const RTLIL::SigChunk &left, const RTLIL::SigChunk &right)
+	{
+		if (left.wire != nullptr || right.wire != nullptr)
+			return left.wire != nullptr && left.wire == right.wire &&
+					left.offset + left.width == right.offset;
+		return true;
+	}
+
+	static void extend_image(RTLIL::SigChunk &left, const RTLIL::SigChunk &right)
+	{
+		if (left.wire != nullptr) {
+			left.width += right.width;
+			return;
+		}
+		left.data.insert(left.data.end(), right.data.begin(), right.data.end());
+		left.width += right.width;
 	}
 
 	// Add connections from "from" to "to". A single untouched chunk is one

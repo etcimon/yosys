@@ -22,6 +22,7 @@
 // Second Edition (2nd ed.). Wiley. ISBN 978-0-471-11709-4, page 244
 
 #include "kernel/yosys.h"
+#include "kernel/stateops.h"
 #include "libs/bigint/BigIntegerLibrary.hh"
 
 YOSYS_NAMESPACE_BEGIN
@@ -119,13 +120,6 @@ static RTLIL::State logic_xor(RTLIL::State a, RTLIL::State b)
 	return a != b ? RTLIL::State::S1 : RTLIL::State::S0;
 }
 
-static RTLIL::State logic_xnor(RTLIL::State a, RTLIL::State b)
-{
-	if (a != RTLIL::State::S0 && a != RTLIL::State::S1) return RTLIL::State::Sx;
-	if (b != RTLIL::State::S0 && b != RTLIL::State::S1) return RTLIL::State::Sx;
-	return a == b ? RTLIL::State::S1 : RTLIL::State::S0;
-}
-
 RTLIL::Const RTLIL::const_not(const RTLIL::Const &arg1, const RTLIL::Const&, bool signed1, bool, int result_len)
 {
 	if (result_len < 0)
@@ -134,20 +128,15 @@ RTLIL::Const RTLIL::const_not(const RTLIL::Const &arg1, const RTLIL::Const&, boo
 	RTLIL::Const arg1_ext = arg1;
 	extend_u0(arg1_ext, result_len, signed1);
 
-	RTLIL::Const result(RTLIL::State::Sx, result_len);
-	for (auto i = 0; i < result_len; i++) {
-		if (i >= GetSize(arg1_ext))
-			result.set(i, RTLIL::State::S0);
-		else if (arg1_ext[i] == RTLIL::State::S0)
-			result.set(i, RTLIL::State::S1);
-		else if (arg1_ext[i] == RTLIL::State::S1)
-			result.set(i, RTLIL::State::S0);
-	}
+	// extend_u0 made arg1_ext exactly result_len bits; the byte kernel inverts
+	// two-state lanes and leaves everything else Sx, as the per-bit form did.
+	std::vector<RTLIL::State> out(result_len);
+	stateops::logic_not(out.data(), arg1_ext.bit_data(), result_len);
 
-	return result;
+	return RTLIL::Const(std::move(out));
 }
 
-static RTLIL::Const logic_wrapper(RTLIL::State(*logic_func)(RTLIL::State, RTLIL::State),
+static RTLIL::Const logic_wrapper(stateops::Op op,
 		RTLIL::Const arg1, RTLIL::Const arg2, bool signed1, bool signed2, int result_len = -1)
 {
 	if (result_len < 0)
@@ -156,34 +145,33 @@ static RTLIL::Const logic_wrapper(RTLIL::State(*logic_func)(RTLIL::State, RTLIL:
 	extend_u0(arg1, result_len, signed1);
 	extend_u0(arg2, result_len, signed2);
 
-	RTLIL::Const result(RTLIL::State::Sx, result_len);
-	for (auto i = 0; i < result_len; i++) {
-		RTLIL::State a = i < GetSize(arg1) ? arg1[i] : RTLIL::State::S0;
-		RTLIL::State b = i < GetSize(arg2) ? arg2[i] : RTLIL::State::S0;
-		result.set(i, logic_func(a, b));
-	}
+	// Both operands are exactly result_len bits after extension, so the lane
+	// kernel covers the whole result; stateops::scalar is the reference
+	// definition of each op (the former logic_and/or/xor/xnor).
+	std::vector<RTLIL::State> out(result_len);
+	stateops::logic(op, out.data(), arg1.bit_data(), arg2.bit_data(), result_len);
 
-	return result;
+	return RTLIL::Const(std::move(out));
 }
 
 RTLIL::Const RTLIL::const_and(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len)
 {
-	return logic_wrapper(logic_and, arg1, arg2, signed1, signed2, result_len);
+	return logic_wrapper(stateops::Op::And, arg1, arg2, signed1, signed2, result_len);
 }
 
 RTLIL::Const RTLIL::const_or(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len)
 {
-	return logic_wrapper(logic_or, arg1, arg2, signed1, signed2, result_len);
+	return logic_wrapper(stateops::Op::Or, arg1, arg2, signed1, signed2, result_len);
 }
 
 RTLIL::Const RTLIL::const_xor(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len)
 {
-	return logic_wrapper(logic_xor, arg1, arg2, signed1, signed2, result_len);
+	return logic_wrapper(stateops::Op::Xor, arg1, arg2, signed1, signed2, result_len);
 }
 
 RTLIL::Const RTLIL::const_xnor(const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len)
 {
-	return logic_wrapper(logic_xnor, arg1, arg2, signed1, signed2, result_len);
+	return logic_wrapper(stateops::Op::Xnor, arg1, arg2, signed1, signed2, result_len);
 }
 
 static RTLIL::Const logic_reduce_wrapper(RTLIL::State initial, RTLIL::State(*logic_func)(RTLIL::State, RTLIL::State), const RTLIL::Const &arg1, int result_len)

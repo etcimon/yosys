@@ -10,6 +10,7 @@ yosys_gtest(kernel
 	rtlilTest.cc
 	sigmapTest.cc
 	sigspecExtractTest.cc
+	stateopsTest.cc
 	sigspecRemove2Test.cc
 	threadingTest.cc
 )

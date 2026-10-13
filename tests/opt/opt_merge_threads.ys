@@ -1,0 +1,22 @@
+# Enough cells to hash on worker threads, and a second pass once the first
+# pair is tied. The workers must not wait on the next range while the main
+# thread waits for duplicates.
+read_verilog <<EOT
+module top(input [7:0] a, b, c, output [7:0] y);
+  genvar i;
+  generate
+    for (i = 0; i < 1000; i = i + 1) begin : g
+      wire [7:0] lo, hi;
+      assign lo = a + b;
+      assign hi = lo + c;
+    end
+  endgenerate
+  assign y = g[0].hi;
+endmodule
+EOT
+hierarchy -top top
+flatten
+proc
+select -assert-count 2000 t:$add
+opt_merge
+select -assert-count 2 t:$add
