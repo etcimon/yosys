@@ -289,6 +289,10 @@ ShardedVector<RTLIL::SigBit> build_candidates(ExactCellWires& cell_wires, const 
 		}
 		for (int i : ctx.item_range(actx.mod->wires_size())) {
 			RTLIL::Wire *wire = actx.mod->wire_at(i);
+			// add(SigBit) promotes only bits stored in the union-find. An
+			// alias-only wire cannot change representative here.
+			if (!actx.assign_map.bit_wires.count(wire))
+				continue;
 			for (int j = 0; j < wire->width; ++j) {
 				RTLIL::SigBit s1(wire, j);
 				RTLIL::SigBit s2 = actx.assign_map(s1);

@@ -102,6 +102,187 @@ static pool<RTLIL::IdString> live_loop_wires(const dict<WireNode, pool<WireNode>
 	return live;
 }
 
+// Drivers and uses stored per chunk. Warnings expand a bit only when that
+// bit is undriven or has more than one counting driver, so a healthy wide
+// port is one record instead of one string per bit.
+struct ChunkDrivers {
+	struct Drv {
+		int offset;
+		int width;
+		int msg0;
+		Cell *cell;
+		IdString port;
+		Wire *inwire;
+		bool counts;
+		std::string extra;
+
+		bool covers(int bit) const { return bit >= offset && bit < offset + width; }
+
+		std::string describe(int bit) const {
+			if (!extra.empty())
+				return extra;
+			int idx = msg0 + (bit - offset);
+			if (cell)
+				return stringf("port %s[%d] of cell %s (%s)", port.unescape(), idx, cell, cell->type.unescape());
+			if (inwire)
+				return stringf("module input %s[%d]", inwire, idx);
+			return {};
+		}
+	};
+	struct Use { int offset, width; };
+
+	dict<Wire *, std::vector<Drv>> by_wire;
+	dict<Wire *, std::vector<Use>> used;
+	dict<SigBit, vector<string>> const_msgs;
+
+	void add_sig(const SigSpec &sig, Cell *cell, IdString port, Wire *inwire, bool counts, const std::string &extra)
+	{
+		int at = 0;
+		for (auto const &chunk : sig.chunks()) {
+			if (chunk.wire == nullptr) {
+				for (int k = 0; k < chunk.width; k++) {
+					std::string text;
+					if (!extra.empty())
+						text = extra;
+					else if (cell != nullptr && counts)
+						text = stringf("port %s[%d] of cell %s (%s)", port.unescape(), at + k, cell, cell->type.unescape());
+					else if (inwire != nullptr && counts)
+						text = stringf("module input %s[%d]", inwire, at + k);
+					if (!text.empty())
+						const_msgs[SigBit(chunk.data[k])].push_back(text);
+				}
+			} else {
+				by_wire[chunk.wire].push_back(Drv{chunk.offset, chunk.width, at, cell, port, inwire, counts, extra});
+			}
+			at += chunk.width;
+		}
+	}
+
+	void add_use(const SigSpec &sig)
+	{
+		for (auto const &chunk : sig.chunks())
+			if (chunk.wire != nullptr)
+				used[chunk.wire].push_back(Use{chunk.offset, chunk.width});
+	}
+
+	Cell *last_cell(SigBit bit) const
+	{
+		if (bit.wire == nullptr)
+			return nullptr;
+		auto found = by_wire.find(bit.wire);
+		if (found == by_wire.end())
+			return nullptr;
+		Cell *cell = nullptr;
+		for (auto const &drv : found->second)
+			if (drv.cell != nullptr && drv.covers(bit.offset))
+				cell = drv.cell;
+		return cell;
+	}
+
+	void warn(Module *module, int &counter) const
+	{
+		for (auto const &it : const_msgs) {
+			string message = stringf("Drivers conflicting with a constant %s driver:\n", log_signal(it.first));
+			for (auto const &str : it.second)
+				message += stringf("    %s\n", str);
+			log_warning("%s", message);
+			counter++;
+		}
+
+		pool<Wire *> wires;
+		for (auto const &it : by_wire)
+			wires.insert(it.first);
+		for (auto const &it : used)
+			wires.insert(it.first);
+
+		for (auto wire : wires) {
+			const std::vector<Drv> *drvs = nullptr;
+			auto dit = by_wire.find(wire);
+			if (dit != by_wire.end())
+				drvs = &dit->second;
+			const std::vector<Use> *uses = nullptr;
+			auto uit = used.find(wire);
+			if (uit != used.end())
+				uses = &uit->second;
+
+			std::vector<std::pair<int, int>> events;
+			if (drvs) {
+				for (auto const &drv : *drvs)
+					if (drv.counts) {
+						events.push_back({drv.offset, 1});
+						events.push_back({drv.offset + drv.width, -1});
+					}
+			}
+			std::sort(events.begin(), events.end());
+			int count = 0;
+			int prev = 0;
+			std::vector<std::pair<int, int>> multi;
+			for (auto ev : events) {
+				if (count > 1 && ev.first > prev)
+					multi.push_back({prev, ev.first});
+				count += ev.second;
+				prev = ev.first;
+			}
+			for (auto range : multi) {
+				for (int bit = range.first; bit < range.second; bit++) {
+					string message = stringf("multiple conflicting drivers for %s.%s:\n", module, log_signal(SigBit(wire, bit)));
+					if (drvs) {
+						for (auto const &drv : *drvs) {
+							if (!drv.covers(bit))
+								continue;
+							std::string text = drv.describe(bit);
+							if (!text.empty())
+								message += stringf("    %s\n", text);
+						}
+					}
+					log_warning("%s", message);
+					counter++;
+				}
+			}
+
+			std::vector<std::pair<int, int>> covered;
+			if (drvs) {
+				for (auto const &drv : *drvs)
+					covered.push_back({drv.offset, drv.offset + drv.width});
+				std::sort(covered.begin(), covered.end());
+				std::vector<std::pair<int, int>> merged;
+				for (auto iv : covered) {
+					if (merged.empty() || iv.first > merged.back().second)
+						merged.push_back(iv);
+					else
+						merged.back().second = std::max(merged.back().second, iv.second);
+				}
+				covered.swap(merged);
+			}
+			if (!uses)
+				continue;
+			for (auto use : *uses) {
+				int cursor = use.offset;
+				int end = use.offset + use.width;
+				for (auto iv : covered) {
+					if (iv.second <= cursor)
+						continue;
+					if (iv.first >= end)
+						break;
+					if (iv.first > cursor) {
+						for (int bit = cursor; bit < std::min(iv.first, end); bit++) {
+							log_warning("Wire %s.%s is used but has no driver.\n", module, log_signal(SigBit(wire, bit)));
+							counter++;
+						}
+					}
+					cursor = std::max(cursor, iv.second);
+					if (cursor >= end)
+						break;
+				}
+				for (int bit = cursor; bit < end; bit++) {
+					log_warning("Wire %s.%s is used but has no driver.\n", module, log_signal(SigBit(wire, bit)));
+					counter++;
+				}
+			}
+		}
+	}
+};
+
 struct CheckPass : public Pass {
 	CheckPass() : Pass("check", "check for obvious problems in the design") { }
 	bool formatted_help() override {
@@ -229,10 +410,7 @@ struct CheckPass : public Pass {
 			}
 
 			SigMap sigmap(module);
-			dict<SigBit, vector<string>> wire_drivers;
-			dict<SigBit, Cell *> driver_cells;
-			dict<SigBit, int> wire_drivers_count;
-			pool<SigBit> used_wires;
+			ChunkDrivers drivers;
 			TopoSort<std::pair<RTLIL::IdString, int>> topo;
 			dict<WireNode, pool<WireNode>> coarse_fwd, coarse_rev;
 			for (auto &proc_it : module->processes)
@@ -241,51 +419,42 @@ struct CheckPass : public Pass {
 				std::vector<RTLIL::CaseRule*> all_cases = {&proc_it.second->root_case};
 				for (size_t i = 0; i < all_cases.size(); i++) {
 					for (auto action : all_cases[i]->actions) {
-						for (auto bit : sigmap(action.first)) {
-							wire_drivers[bit].push_back(
+						drivers.add_sig(sigmap(action.first), nullptr, IdString(), nullptr, false,
 								stringf("action %s <= %s (case rule) in process %s",
 										log_signal(action.first), log_signal(action.second), proc_it.first.unescape()));
+						for (auto bit : sigmap(action.first))
 							if (bit.wire)
 								proc_driven_bits.insert(bit);
-						}
-
-						for (auto bit : sigmap(action.second))
-							if (bit.wire) used_wires.insert(bit);
+						drivers.add_use(sigmap(action.second));
 					}
 					for (auto switch_ : all_cases[i]->switches) {
 						for (auto case_ : switch_->cases) {
 							all_cases.push_back(case_);
 							for (auto compare : case_->compare)
-								for (auto bit : sigmap(compare))
-									if (bit.wire) used_wires.insert(bit);
+								drivers.add_use(sigmap(compare));
 						}
 					}
 				}
 				for (auto &sync : proc_it.second->syncs) {
-					for (auto bit : sigmap(sync->signal))
-						if (bit.wire) used_wires.insert(bit);
+					drivers.add_use(sigmap(sync->signal));
 					for (auto action : sync->actions) {
-						for (auto bit : sigmap(action.first)) {
-							wire_drivers[bit].push_back(
+						drivers.add_sig(sigmap(action.first), nullptr, IdString(), nullptr, false,
 								stringf("action %s <= %s (sync rule) in process %s",
 										log_signal(action.first), log_signal(action.second), proc_it.first.unescape()));
-							if (bit.wire && sync->type != RTLIL::SyncType::STi)
-								proc_driven_bits.insert(bit);
-						}
-						for (auto bit : sigmap(action.second))
-							if (bit.wire) used_wires.insert(bit);
+						if (sync->type != RTLIL::SyncType::STi)
+							for (auto bit : sigmap(action.first))
+								if (bit.wire)
+									proc_driven_bits.insert(bit);
+						drivers.add_use(sigmap(action.second));
 					}
 					for (auto memwr : sync->mem_write_actions) {
-						for (auto bit : sigmap(memwr.address))
-							if (bit.wire) used_wires.insert(bit);
-						for (auto bit : sigmap(memwr.data))
-							if (bit.wire) used_wires.insert(bit);
-						for (auto bit : sigmap(memwr.enable))
-							if (bit.wire) used_wires.insert(bit);
+						drivers.add_use(sigmap(memwr.address));
+						drivers.add_use(sigmap(memwr.data));
+						drivers.add_use(sigmap(memwr.enable));
 					}
 				}
 				for (auto bit : proc_driven_bits)
-					wire_drivers_count[bit]++;
+					drivers.add_sig(bit, nullptr, IdString(), nullptr, true, {});
 			}
 
 			struct CircuitEdgesDatabase : AbstractCellEdgesDatabase {
@@ -453,21 +622,11 @@ struct CheckPass : public Pass {
 				for (auto &conn : cell->connections()) {
 					bool input = cell->input(conn.first);
 					bool output = cell->output(conn.first);
-
 					SigSpec sig = sigmap(conn.second);
-					for (int i = 0; i < sig.size(); i++) {
-						SigBit bit = sig[i];
-
-						if (input && bit.wire)
-							used_wires.insert(bit);
-						if (output && !input && bit.wire)
-						wire_drivers_count[bit]++;
-						if (output && (bit.wire || !input))
-							wire_drivers[bit].push_back(stringf("port %s[%d] of cell %s (%s)", conn.first.unescape(), i,
-																cell, cell->type.unescape()));
-						if (output)
-							driver_cells[bit] = cell;
-					}
+					if (input)
+						drivers.add_use(sig);
+					if (output)
+						drivers.add_sig(sig, cell, conn.first, nullptr, output && !input, {});
 				}
 
 				if (yosys_celltypes.cell_evaluable(cell->type) || cell->type.in(ID($mem_v2), ID($memrd), ID($memrd_v2), ID($barrier)) \
@@ -480,18 +639,10 @@ struct CheckPass : public Pass {
 			pool<SigBit> init_bits;
 
 			for (auto wire : module->wires()) {
-				if (wire->port_input) {
-					SigSpec sig = sigmap(wire);
-					for (int i = 0; i < GetSize(sig); i++)
-						if (sig[i].wire || !wire->port_output)
-							wire_drivers[sig[i]].push_back(stringf("module input %s[%d]", wire, i));
-				}
+				if (wire->port_input)
+					drivers.add_sig(sigmap(wire), nullptr, IdString(), wire, !wire->port_output, {});
 				if (wire->port_output)
-					for (auto bit : sigmap(wire))
-						if (bit.wire) used_wires.insert(bit);
-				if (wire->port_input && !wire->port_output)
-					for (auto bit : sigmap(wire))
-						if (bit.wire) wire_drivers_count[bit]++;
+					drivers.add_use(sigmap(wire));
 				if (wire->attributes.count(ID::init)) {
 					Const initval = wire->attributes.at(ID::init);
 					for (int i = 0; i < GetSize(initval) && i < GetSize(wire); i++)
@@ -504,29 +655,7 @@ struct CheckPass : public Pass {
 				}
 			}
 
-			for (auto state : {State::S0, State::S1, State::Sx})
-				if (wire_drivers.count(state)) {
-					string message = stringf("Drivers conflicting with a constant %s driver:\n", log_signal(state));
-					for (auto str : wire_drivers[state])
-						message += stringf("    %s\n", str);
-					log_warning("%s", message);
-					counter++;
-				}
-
-			for (auto it : wire_drivers)
-				if (wire_drivers_count[it.first] > 1) {
-					string message = stringf("multiple conflicting drivers for %s.%s:\n", module, log_signal(it.first));
-					for (auto str : it.second)
-						message += stringf("    %s\n", str);
-					log_warning("%s", message);
-					counter++;
-				}
-
-			for (auto bit : used_wires)
-				if (!wire_drivers.count(bit)) {
-					log_warning("Wire %s.%s is used but has no driver.\n", module, log_signal(bit));
-					counter++;
-				}
+			drivers.warn(module, counter);
 
 			pool<RTLIL::IdString> live_wires = live_loop_wires(coarse_fwd, coarse_rev);
 			if (!live_wires.empty()) {
@@ -585,8 +714,8 @@ struct CheckPass : public Pass {
 					Wire *wire = module->wire(pair.first);
 					log_assert(wire);
 					SigBit bit(module->wire(pair.first), pair.second);
-					log_assert(driver_cells.count(bit));
-					Cell *driver = driver_cells.at(bit);
+					Cell *driver = drivers.last_cell(bit);
+					log_assert(driver);
 
 					std::string driver_src;
 					if (driver->has_attribute(ID::src)) {

@@ -281,24 +281,45 @@ struct SigMapView
 		bit_wires.clear();
 	}
 
+	// Ranges on one wire are sorted by offset and do not overlap.
+	const AliasRange *covering_alias(const std::vector<AliasRange> &ranges, int offset, int width) const
+	{
+		if (ranges.empty() || width <= 0)
+			return nullptr;
+		auto it = std::upper_bound(ranges.begin(), ranges.end(), offset,
+				[](int off, const AliasRange &range) { return off < range.offset; });
+		if (it == ranges.begin())
+			return nullptr;
+		--it;
+		if (it->offset <= offset && offset + width <= it->offset + it->width)
+			return &*it;
+		return nullptr;
+	}
+
 	const AliasRange *find_alias(RTLIL::Wire *wire, int offset) const
 	{
 		auto found = alias_ranges.find(wire);
 		if (found == alias_ranges.end())
 			return nullptr;
-		for (const AliasRange &range : found->second)
-			if (offset >= range.offset && offset < range.offset + range.width)
-				return &range;
-		return nullptr;
+		return covering_alias(found->second, offset, 1);
 	}
 
 	bool alias_overlaps(RTLIL::Wire *wire, int offset, int width) const
 	{
 		auto found = alias_ranges.find(wire);
-		if (found == alias_ranges.end())
+		if (found == alias_ranges.end() || width <= 0)
 			return false;
-		for (const AliasRange &range : found->second)
-			if (offset < range.offset + range.width && range.offset < offset + width)
+		const std::vector<AliasRange> &ranges = found->second;
+		auto it = std::upper_bound(ranges.begin(), ranges.end(), offset,
+				[](int off, const AliasRange &range) { return off < range.offset; });
+		if (it != ranges.begin()) {
+			auto prev = it;
+			--prev;
+			if (offset < prev->offset + prev->width && prev->offset < offset + width)
+				return true;
+		}
+		for (; it != ranges.end() && it->offset < offset + width; ++it)
+			if (offset < it->offset + it->width)
 				return true;
 		return false;
 	}
@@ -317,13 +338,7 @@ struct SigMapView
 			auto found = alias_ranges.find(image.wire);
 			if (found == alias_ranges.end())
 				break;
-			const AliasRange *cover = nullptr;
-			for (const AliasRange &range : found->second) {
-				if (range.offset <= image.offset && range.offset + range.width >= image.offset + image.width) {
-					cover = &range;
-					break;
-				}
-			}
+			const AliasRange *cover = covering_alias(found->second, image.offset, image.width);
 			if (cover == nullptr)
 				break;
 			image = cover->image.extract(image.offset - cover->offset, image.width);

@@ -108,15 +108,45 @@ struct OptMergeThreadWorker
 	bool mode_share_all;
 	bool mode_keepdc;
 
+	// Lane i is B[i*width +: width]. Built from chunks so a wide data word is
+	// not walked bit by bit. The lane SigSpec matches SigSpec::extract, so the
+	// hash stays the same for equal muxes.
+	static std::vector<SigSpec> pmux_lanes(const SigSpec &sig_b, int s_width, int width)
+	{
+		std::vector<SigSpec> lanes(s_width);
+		if (s_width <= 0 || width <= 0)
+			return lanes;
+		std::vector<SigChunk> parts;
+		for (auto const &chunk : sig_b.chunks())
+			parts.push_back(chunk);
+		int ci = 0;
+		int local = 0;
+		for (int lane = 0; lane < s_width; lane++) {
+			int need = width;
+			while (need > 0) {
+				log_assert(ci < GetSize(parts));
+				int have = parts[ci].width - local;
+				int take = std::min(have, need);
+				lanes[lane].append(parts[ci].extract(local, take));
+				local += take;
+				need -= take;
+				if (local == parts[ci].width) {
+					ci++;
+					local = 0;
+				}
+			}
+		}
+		return lanes;
+	}
+
 	static Hasher hash_pmux_in(const SigSpec& sig_s, const SigSpec& sig_b, Hasher h)
 	{
 		int s_width = GetSize(sig_s);
-		int width = GetSize(sig_b) / s_width;
-
+		int width = s_width ? GetSize(sig_b) / s_width : 0;
 		hashlib::commutative_hash comm;
+		std::vector<SigSpec> lanes = pmux_lanes(sig_b, s_width, width);
 		for (int i = 0; i < s_width; i++)
-			comm.eat(hash_pair(sig_s[i], sig_b.extract(i*width, width)));
-
+			comm.eat(hash_pair(sig_s[i], lanes[i]));
 		return comm.hash_into(h);
 	}
 
@@ -124,13 +154,13 @@ struct OptMergeThreadWorker
 	{
 		const SigSpec &sig_s = conn.at(ID::S);
 		const SigSpec &sig_b = conn.at(ID::B);
-
 		int s_width = GetSize(sig_s);
-		int width = GetSize(sig_b) / s_width;
+		int width = s_width ? GetSize(sig_b) / s_width : 0;
 
 		vector<pair<SigBit, SigSpec>> sb_pairs;
+		std::vector<SigSpec> lanes = pmux_lanes(sig_b, s_width, width);
 		for (int i = 0; i < s_width; i++)
-			sb_pairs.push_back(pair<SigBit, SigSpec>(sig_s[i], sig_b.extract(i*width, width)));
+			sb_pairs.push_back(pair<SigBit, SigSpec>(sig_s[i], std::move(lanes[i])));
 
 		std::sort(sb_pairs.begin(), sb_pairs.end());
 
