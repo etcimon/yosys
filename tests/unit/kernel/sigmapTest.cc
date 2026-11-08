@@ -209,6 +209,66 @@ TEST_F(SigmapAndCheckTest, BitAtATimeAliasMatchesWholeWire)
 		EXPECT_EQ(spec[i], SigBit(b, i));
 }
 
+TEST_F(SigmapAndCheckTest, CompoundConnectionMergesExistingAliasRanges)
+{
+	for (int width : {8, 32, 65, 161}) {
+		Design design;
+		Module *mod = design.addModule("\\m");
+		Wire *a = mod->addWire("\\a", width);
+		Wire *b = mod->addWire("\\b", width);
+		Wire *c = mod->addWire("\\c", width / 2);
+		SigMap map;
+		map.add(SigSpec(a), SigSpec(b));
+		SigSpec rhs(c);
+		rhs.append(SigSpec(State::S0, width - c->width));
+		map.add(SigSpec(a), rhs);
+		for (int i = 0; i < width; i++) {
+			const SigBit expected = i < c->width ? map(SigBit(c, i)) : SigBit(State::S0);
+			EXPECT_EQ(map(SigBit(a, i)), expected);
+			EXPECT_EQ(map(SigBit(b, i)), expected);
+		}
+	}
+}
+
+TEST_F(SigmapAndCheckTest, CompoundConnectionResolvesAliasOnRight)
+{
+	Design design;
+	Module *mod = design.addModule("\\m");
+	Wire *a = mod->addWire("\\a", 8);
+	Wire *b = mod->addWire("\\b", 8);
+	Wire *c = mod->addWire("\\c", 16);
+	SigMap map;
+	map.add(SigSpec(a), SigSpec(b));
+	SigSpec rhs(a);
+	rhs.append(SigSpec(State::S1, 8));
+	map.add(SigSpec(c), rhs);
+	map.add(SigSpec(b), SigSpec(State::S0, 8));
+	for (int i = 0; i < 16; i++)
+		EXPECT_EQ(map(SigBit(c, i)), SigBit(i < 8 ? State::S0 : State::S1));
+}
+
+TEST_F(SigmapAndCheckTest, PromotionInvalidatesWholeWireAndSliceCache)
+{
+	Design design;
+	Module *mod = design.addModule("\\m");
+	Wire *a = mod->addWire("\\a", 32);
+	Wire *b = mod->addWire("\\b", 32);
+	// The repeated connection materializes the range in the union-find.
+	mod->connect(a, b);
+	mod->connect(a, b);
+	SigMap map(mod);
+	Wire *preferred = map(SigBit(a, 0)).wire == a ? b : a;
+	map.add(SigSpec(preferred));
+	SigSpec whole = map(a);
+	SigSpec slice = map(SigSpec(a, 3, 8));
+	for (int i = 0; i < 32; i++) {
+		EXPECT_EQ(map(SigBit(a, i)), SigBit(preferred, i));
+		EXPECT_EQ(whole[i], map(SigBit(a, i)));
+		if (i >= 3 && i < 11)
+			EXPECT_EQ(slice[i - 3], map(SigBit(a, i)));
+	}
+}
+
 // The span walk of apply(SigSpec&) must return, bit for bit, what the per-bit
 // loop of apply(SigBit&) returns, on random mixes of whole-wire, partial,
 // reversed, constant and self-referencing connections, including chains deep

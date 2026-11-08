@@ -1000,8 +1000,14 @@ struct SigMap final : public SigMapView
 		if (from.is_chunk() && to.is_chunk() && try_alias_chunk(from.as_chunk(), to.as_chunk()))
 			return;
 
+		// Compound connections can touch ranges already stored as aliases.
+		// Merge their representatives, otherwise the range walk bypasses the
+		// new union-find edges and loses the compound connection.
+		RTLIL::SigSpec resolved_from = from, resolved_to = to;
+		apply(resolved_from);
+		apply(resolved_to);
 		for (int i = 0; i < GetSize(from); i++)
-			merge_pair(from[i], to[i]);
+			merge_pair(resolved_from[i], resolved_to[i]);
 	}
 
 	// Make bit the representative of its set when that set lives entirely in
@@ -1018,6 +1024,7 @@ struct SigMap final : public SigMapView
 			return;
 		if (mfp_rep.wire == nullptr)
 			return;
+		invalidate_canon();
 		database.promote(bit);
 	}
 
